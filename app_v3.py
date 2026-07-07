@@ -1581,7 +1581,7 @@ class GratmaApp:
                     for r in data["records"]:
                         groups.setdefault(r["sensor"], []).append(r)
                     for sensor, recs in sorted(groups.items()):
-                        path = self._csv_path(f"S{sensor}", "idt", 1)
+                        path = self._csv_path(f"{sensor}", "idt", 1)
                         self._write_idt_csv(path, recs)
                         written.append(path)
 
