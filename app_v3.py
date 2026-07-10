@@ -1,5 +1,31 @@
 """
-app_v4.py — GRATMA v3.2.0 Desktop Application (tkinter + matplotlib)
+app_v4.py — GRATMA v3.4.0 Desktop Application (tkinter + matplotlib)
+
+Improvements v3.4.0:
+    - New "Test Paco" measurement type: like I-V Randomised but with the
+      random order and GND-unselected behaviours ALWAYS active (no checkbox
+      needed), and with a drain cycle around every sensor: all drains are
+      grounded (0 V, all switches connected) before and after each sensor;
+      to measure, everything is disconnected, VD is applied to the drain,
+      the sensor's drain map is selected and the drain settle time is
+      waited before the sweep. Default I-V parameters for this mode:
+      VS=50 mV, VG 0→1200 mV, step 15 mV, repetitions 3.
+
+Improvements v3.3.0:
+    - Terminal recovery log: everything printed to the terminal (app log,
+      every measurement point as it arrives from the GRATMA, tracebacks)
+      is also saved — flushed line by line — into
+      gratma_terminal_<date>_<time>.txt next to this script. It is a
+      last-resort backup: if the app crashes while the GRATMA keeps
+      measuring, the points already received can be recovered from that
+      file. When the process finishes correctly (measurements completed
+      and exported, no errors) the file is deleted automatically on exit;
+      it is kept after a crash, an aborted measurement or an unsaved one.
+    - "Sensors to represent" box in the Data Analysis tab (all selected by
+      default; unticking a sensor excludes it from every plot) and a
+      "Save all PNG" button that saves the four plots automatically named
+      <data name>_<plot type>.png (Forward curves, Reverse curves,
+      Mean std, Dirac violin).
 
 Improvements v3.2.0:
     - New "GND unselected" checkbox (next to "Random", I-V Randomised type):
@@ -42,8 +68,10 @@ import math
 import os
 import queue
 import random
+import sys
 import threading
 import time
+import traceback
 from datetime import datetime
 from tkinter import (
     BOTH, DISABLED, END, INSERT, NORMAL, X, Y, BooleanVar, Canvas, Frame,
@@ -92,13 +120,141 @@ SENSOR_COLORS = [
     "#f59f00",  # S7 yellow
     "#d6336c",  # S8 pink
 ]
+# Per-sensor drain switch maps used by the "Test Paco" mode: sensor
+# (1-based) -> (map for SW0, map for SW1), written to the MAX14662 to
+# pre-select the sensor's drain while VD settles before its sweep.
+# Default: bit N-1 on both switches. EDIT THIS TABLE if the board wiring
+# uses different maps (equivalent to DRAIN_SENSOR_MAPS in the console script).
+TESTPACO_DRAIN_SENSOR_MAPS = {s: (1 << (s - 1), 1 << (s - 1)) for s in range(1, 9)}
+# ---------------------------------------------------------------------------
+# Terminal recovery log
+# ---------------------------------------------------------------------------
+class _TeeStream:
+    """File-like object that writes both to the real terminal stream and to
+    the recovery file, flushing the file after every write so the content
+    survives a hard crash."""
+    def __init__(self, stream, fh):
+        self._stream = stream   # may be None (e.g. pythonw, no console)
+        self._fh = fh
+    def write(self, text) -> int:
+        try:
+            if self._stream is not None:
+                self._stream.write(text)
+        except Exception:
+            pass
+        try:
+            self._fh.write(text)
+            self._fh.flush()
+        except Exception:
+            pass
+        return len(text)
+    def flush(self) -> None:
+        for s in (self._stream, self._fh):
+            try:
+                if s is not None:
+                    s.flush()
+            except Exception:
+                pass
+    def isatty(self) -> bool:
+        try:
+            return bool(self._stream is not None and self._stream.isatty())
+        except Exception:
+            return False
+
+
+class TerminalRecorder:
+    """Saves EVERYTHING that appears in the terminal into a .txt file, as a
+    last-resort backup of the measurement data: if the app fails while the
+    GRATMA keeps measuring, the points already received (printed as DATA
+    lines) can be recovered from this file. Every line is flushed to disk
+    immediately.
+
+    The file is deleted automatically on exit when the process finished
+    correctly: no unhandled errors, no measurement left running/aborted,
+    and the last measurement exported to CSV. Otherwise it is kept."""
+
+    def __init__(self) -> None:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        folder = os.path.dirname(os.path.abspath(__file__))
+        # PID in the name: two app instances never collide on the same file.
+        self.path = os.path.join(folder, f"gratma_terminal_{ts}_p{os.getpid()}.txt")
+        self._fh = open(self.path, "w", encoding="utf-8")
+        self._keep = False          # an error happened somewhere
+        self._meas_running = False  # a measurement is in progress / was aborted
+        self._unsaved = False       # last finished measurement not exported yet
+        # Tee stdout/stderr: everything printed reaches terminal AND file.
+        sys.stdout = _TeeStream(sys.__stdout__, self._fh)
+        sys.stderr = _TeeStream(sys.__stderr__, self._fh)
+        # Uncaught exceptions (main thread and worker threads) must also
+        # land in the file before the process dies.
+        sys.excepthook = self._excepthook
+        threading.excepthook = self._thread_excepthook
+        print(f"=== GRATMA terminal log started {datetime.now():%Y-%m-%d %H:%M:%S} ===")
+        print(f"=== Recovery file: {self.path} ===")
+        print("=== DATA line format: DATA type=<1 sweep|3 idt> sensor=Sn rep=k "
+              "fwd|bwd seq=<point|ms> v1 v2 v3 v4 "
+              "(sweep: Vg[V] Is[A] Vs[V] Ig[A] — idt: Vsbus[V] Is[A] Vg[V] Ig[A]) ===")
+
+    # -- exception hooks ----------------------------------------------------
+    def _excepthook(self, exc_type, exc, tb) -> None:
+        self._keep = True
+        traceback.print_exception(exc_type, exc, tb)
+
+    def _thread_excepthook(self, args) -> None:
+        self._keep = True
+        name = getattr(args.thread, "name", "?") if args.thread else "?"
+        print(f"--- Unhandled exception in thread {name!r} ---")
+        traceback.print_exception(args.exc_type, args.exc_value, args.exc_traceback)
+
+    # -- state notifications (called by the app) -----------------------------
+    def meas_started(self) -> None:
+        self._meas_running = True
+
+    def meas_done(self, saved: bool = False) -> None:
+        """A measurement produced its final result. If it is not exported
+        to CSV yet, the recovery file stays 'needed' until export_ok()."""
+        self._meas_running = False
+        self._unsaved = not saved
+
+    def export_ok(self) -> None:
+        self._unsaved = False
+
+    def keep(self, reason: str = "") -> None:
+        self._keep = True
+        if reason:
+            print(f"--- Terminal log will be kept: {reason} ---")
+
+    # -- shutdown -------------------------------------------------------------
+    def close(self) -> None:
+        """Restores the real streams and deletes the file on a clean finish."""
+        keep = self._keep or self._meas_running or self._unsaved
+        reason = ("error detected" if self._keep else
+                  "measurement running or aborted" if self._meas_running else
+                  "measurement not exported to CSV" if self._unsaved else "")
+        print(f"=== GRATMA terminal log closed {datetime.now():%Y-%m-%d %H:%M:%S} — "
+              + (f"KEEPING {os.path.basename(self.path)} ({reason})" if keep
+                 else "clean finish, deleting recovery file") + " ===")
+        sys.stdout = sys.__stdout__
+        sys.stderr = sys.__stderr__
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+        if not keep:
+            try:
+                os.remove(self.path)
+            except OSError:
+                pass
+
+
 # ---------------------------------------------------------------------------
 # Main Application
 # ---------------------------------------------------------------------------
 class GratmaApp:
-    def __init__(self, root: Tk) -> None:
+    def __init__(self, root: Tk, recorder: 'TerminalRecorder | None' = None) -> None:
         self.root = root
-        self.root.title("GRATMA v3.2.0 — Control & Measurement")
+        self._recorder = recorder
+        self.root.title("GRATMA v3.3.0 — Control & Measurement")
         self.root.configure(bg=BG)
         self.root.minsize(1100, 750)
         self._dev: GratmaUSB | None = None
@@ -311,6 +467,7 @@ class GratmaApp:
             ("idt", "I vs Time (IDT)"),
             ("differential", "Differential Two Points"),
             ("iv_randomised", "I-V Randomised"),
+            ("test_paco", "Test Paco"),
         ]
         for val, lbl in types:
             ttk.Radiobutton(type_frame, text=lbl, variable=self._meas_type,
@@ -434,7 +591,8 @@ class GratmaApp:
         self._mode_hint.pack(anchor="w", pady=(2, 0))
     def _update_sensor_mode_widgets(self) -> None:
         """Swaps the Parallel radio for the Random checkbox in randomised mode."""
-        if self._meas_type.get() == "iv_randomised":
+        meas_type = self._meas_type.get()
+        if meas_type == "iv_randomised":
             self._par_radio.pack_forget()
             self._sensor_mode.set("sequential")  # parallel not allowed here
             self._random_check.pack(side="left", padx=(16, 0))
@@ -444,6 +602,18 @@ class GratmaApp:
                      "the bottom group (5-8). Uncheck for plain sequential order.\n"
                      "GND unselected: while a sensor is measured, every other source\n"
                      "is tied to ground (firmware cmd 0x14; unchecked = left open).")
+        elif meas_type == "test_paco":
+            # Random order and GND-unselected are ALWAYS active in this mode,
+            # so the checkboxes are hidden instead of required.
+            self._par_radio.pack_forget()
+            self._random_check.pack_forget()
+            self._gnd_check.pack_forget()
+            self._sensor_mode.set("sequential")
+            self._mode_hint.config(
+                text="Test Paco: random order (alternating top 1-4 / bottom 5-8) and\n"
+                     "GND unselected are ALWAYS active — no checkbox needed. All\n"
+                     "drains are grounded (0 V, all connected) before and after\n"
+                     "measuring each sensor.")
         else:
             self._random_check.pack_forget()
             self._gnd_check.pack_forget()
@@ -521,8 +691,23 @@ class GratmaApp:
         elif meas_type == "iv_randomised":
             self._params_iv_param.pack(fill=X, pady=6)
             self._params_random.pack(fill=X, pady=6)
+        elif meas_type == "test_paco":
+            self._params_iv_param.pack(fill=X, pady=6)
+            self._params_random.pack(fill=X, pady=6)
+            # Load the recommended defaults for this mode.
+            self._apply_test_paco_defaults()
         # Swap Parallel radio <-> Random checkbox depending on the type
         self._update_sensor_mode_widgets()
+    # Default I-V parameters applied when the "Test Paco" type is selected.
+    _TEST_PACO_IV_DEFAULTS = {"vs": 50, "vg_start": 0, "vg_end": 1200,
+                              "vg_step": 15, "reps": 3}
+    def _apply_test_paco_defaults(self) -> None:
+        d = self._TEST_PACO_IV_DEFAULTS
+        self._iv_vs.set(str(d["vs"]))
+        self._iv_vg_start.set(str(d["vg_start"]))
+        self._iv_vg_end.set(str(d["vg_end"]))
+        self._iv_vg_step.set(str(d["vg_step"]))
+        self._iv_reps.set(str(d["reps"]))
     def _on_pick_folder(self) -> None:
         folder = filedialog.askdirectory(title="Output folder for CSV files")
         if folder:
@@ -1088,6 +1273,12 @@ class GratmaApp:
                 pass
     def _log_write(self, msg: str, color: str = FG_DIM) -> None:
         ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        # Mirror every app-log line to the terminal FIRST (and therefore to
+        # the terminal recovery file), so it survives even if the GUI dies.
+        try:
+            print(f"[{ts}] {msg}")
+        except Exception:
+            pass
         self._log.config(state=NORMAL)
         start = self._log.index(INSERT)
         self._log.insert(END, f"[{ts}] {msg}\n")
@@ -1329,7 +1520,7 @@ class GratmaApp:
         # Reset real-time graph
         self._rt_kind = {
             "iv_parametric": "iv", "idt": "idt", "differential": "differential",
-            "iv_randomised": "iv",
+            "iv_randomised": "iv", "test_paco": "iv",
         }[meas_type]
         self._rt_series = {}
         self._render_meas_plot(final=False)
@@ -1354,6 +1545,8 @@ class GratmaApp:
                     raise ValueError("VG step must be > 0")
                 mask = self._sensor_mask(sensors_list)
                 self._set_busy(True)
+                if self._recorder:
+                    self._recorder.meas_started()
                 self._run_async(self._meas_iv_param_worker,
                                 vs, vg_start, vg_end, vg_step, mask, reverse, reps, parallel)
             elif meas_type == "idt":
@@ -1364,6 +1557,8 @@ class GratmaApp:
                 if period <= 0:
                     raise ValueError("Period must be > 0")
                 self._set_busy(True)
+                if self._recorder:
+                    self._recorder.meas_started()
                 self._run_async(self._meas_idt_worker, sensors_list, vg, vs, total, period, parallel)
             elif meas_type == "differential":
                 vs = int(self._iv_vs.get())
@@ -1376,6 +1571,8 @@ class GratmaApp:
                     raise ValueError("VG step must be > 0")
                 mask = self._sensor_mask(sensors_list)
                 self._set_busy(True)
+                if self._recorder:
+                    self._recorder.meas_started()
                 self._run_async(self._meas_differential_worker,
                                 vs, vg_start, vg_end, vg_step, mask, reverse, reps, parallel)
             elif meas_type == "iv_randomised":
@@ -1401,10 +1598,39 @@ class GratmaApp:
                 # Randomised mode never runs in parallel.
                 self._cur_parallel = False
                 self._set_busy(True)
+                if self._recorder:
+                    self._recorder.meas_started()
                 self._run_async(self._meas_iv_random_worker,
                                 vs, vg_start, vg_end, vg_step, sensors_list, reverse,
                                 stab_s, settle_s, discard, reps, random_mode,
                                 gnd_unselected)
+            elif meas_type == "test_paco":
+                vs = int(self._iv_vs.get())
+                vg_start = int(self._iv_vg_start.get())
+                vg_end = int(self._iv_vg_end.get())
+                vg_step = int(self._iv_vg_step.get())
+                reverse = self._iv_reverse.get()
+                reps = int(self._iv_reps.get())          # kept measures per sensor
+                discard = int(self._rnd_discard.get())   # initial measures to discard
+                if vg_step <= 0:
+                    raise ValueError("VG step must be > 0")
+                stab_s = float(self._rnd_stab_min.get()) * 60.0
+                settle_s = float(self._rnd_settle_s.get())
+                if stab_s < 0 or settle_s < 0:
+                    raise ValueError("Wait times must be >= 0")
+                if reps < 1:
+                    raise ValueError("Repetitions must be >= 1")
+                if discard < 0:
+                    raise ValueError("Measures to discard must be >= 0")
+                # Test Paco never runs in parallel; random order and
+                # GND-unselected are forced inside the worker.
+                self._cur_parallel = False
+                self._set_busy(True)
+                if self._recorder:
+                    self._recorder.meas_started()
+                self._run_async(self._meas_test_paco_worker,
+                                vs, vg_start, vg_end, vg_step, sensors_list, reverse,
+                                stab_s, settle_s, discard, reps)
         except ValueError as e:
             messagebox.showerror("Parameter Error", str(e))
             self._set_busy(False)
@@ -1421,6 +1647,10 @@ class GratmaApp:
             return
         self._abort_measurement = True
         self._log_write("⚠ STOP requested - aborting measurement...", ORANGE)
+        # An aborted measurement is never exported: keep the terminal file
+        # so its partial points can be recovered if needed.
+        if self._recorder:
+            self._recorder.keep("measurement aborted by user")
     def _stream_records(self, update_type: str, point_type: int, end_type: int,
                         phase: int | None = None, poll_s: float = 0.3) -> list[dict] | None:
         """
@@ -1435,6 +1665,19 @@ class GratmaApp:
             while self._dev.get_data_count() > 0:
                 batch = self._dev.get_data(4)
                 all_records.extend(batch)
+                # Print every record to the terminal as soon as it arrives:
+                # this is the raw material of the recovery .txt file, and it
+                # happens in the worker thread, independently of the GUI.
+                for r in batch:
+                    try:
+                        print(f"DATA type={r['type']} sensor=S{r['sensor']} "
+                              f"rep={r['rep']} "
+                              f"{'bwd' if r.get('backward') else 'fwd'} "
+                              f"seq={r['seq']} "
+                              f"{r['v1']:.6g} {r['v2']:.6g} "
+                              f"{r['v3']:.6g} {r['v4']:.6g}")
+                    except Exception:
+                        pass
                 pts = [r for r in batch if r["type"] == point_type]
                 if pts:
                     upd = {"type": update_type, "records": pts}
@@ -1856,6 +2099,152 @@ class GratmaApp:
             "type": "iv_random", "records": kept, "result": None, "meta": meta,
             "n_sensors": len(sensors_list), "n_reps": reps,
         }))
+    # -- Test Paco -------------------------------------------------------------
+    def _meas_test_paco_worker(self, vs, vg_start, vg_end, vg_step, sensors_list,
+                               reverse, stab_s, settle_s, discard, reps) -> None:
+        """'Test Paco' state machine. Like I-V Randomised, but the random
+        order and the GND-unselected mode are ALWAYS active, and every
+        sensor is wrapped in a drain cycle:
+          unselected_sensors_mode: firmware UNSEL_MODE=GND (cmd 0x14, 'um 1')
+          new_chip:      stabilization wait → all connected → 0 V everywhere
+          vd_disc_apply: disconnect all → VD on the drain → sensor drain map
+                         → drain settle wait
+          iv:            single-sensor sweep
+          vd_con_apply:  drain back to 0 V → ALL drains connected (grounded)
+        so all drains are grounded before and after measuring each sensor."""
+        total_seq = discard + reps
+        self._log_write(
+            f"Test Paco: VS(Vd)={vs}mV  VG={vg_start}→{vg_end}mV  step={vg_step}mV  "
+            f"sensors={sensors_list}  discard={discard}  keep(reps)={reps}  "
+            f"→ {total_seq} sequences  (random + GND unselected forced)", CYAN)
+        self._log_vg_end_note(vg_start, vg_end, vg_step)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        def aborted() -> bool:
+            if self._abort_measurement:
+                self._rq.put(("log_warn", "Test Paco aborted by user"))
+                self._rq.put(("busy_off", None))
+                return True
+            return False
+        # Stage "unselected_sensors_mode": always GND ('um 1').
+        gnd_active = True
+        try:
+            self._dev.set_unsel_mode(UnselMode.GND)
+            self._log_write("Unselected-source mode: GND (always on in Test Paco)", CYAN)
+        except GratmaError as e:
+            gnd_active = False
+            self._log_write(
+                f"⚠ Firmware does not support SET_UNSEL_MODE (0x14): {e} — "
+                "continuing without grounding the unselected sources", ORANGE)
+        # Stage "new_chip": stabilization wait, then everything connected @ 0 V.
+        self._log_write(
+            f"Waiting {stab_s / 60.0:.2f} min for the system to stabilize ...", ORANGE)
+        if not self._sleep_abortable(stab_s):
+            self._rq.put(("log_warn", "Test Paco aborted during stabilization"))
+            self._rq.put(("busy_off", None))
+            return
+        self._dev.set_switch(sw=0, sw_map=0xFF)
+        self._dev.set_switch(sw=1, sw_map=0xFF)
+        self._log_write("All connected (SW0/SW1 = 0xFF)", FG_DIM)
+        for dac in (0, 1):
+            for out in (0, 1):
+                self._dev.set_voltage(dac=dac, out=out, mv=0)
+        self._log_write("0 volts applied (both DACs, both channels)", FG_DIM)
+        kept: list[dict] = []
+        for seq in range(1, total_seq + 1):
+            if aborted():
+                return
+            # Random order is ALWAYS used in this mode.
+            order = self._random_sequence_order(sensors_list)
+            is_discard = (seq <= discard)
+            kept_rep = seq - discard  # 1..reps for the sequences we keep
+            tag = "discarded" if is_discard else f"kept as rep {kept_rep}"
+            self._log_write(
+                f"── Sequence {seq}/{total_seq} ({tag}) — order {order} ──", MAGENTA)
+            for sensor in order:
+                if aborted():
+                    return
+                # Stage "vd_disc_apply": disconnect all pins, apply VD to the
+                # drain and pre-select this sensor's drain map while it settles.
+                self._dev.set_switch(sw=0, sw_map=0x00)
+                self._dev.set_switch(sw=1, sw_map=0x00)
+                self._dev.set_voltage(dac=1, out=0, mv=vs)
+                self._dev.set_voltage(dac=1, out=1, mv=vs)
+                map0, map1 = TESTPACO_DRAIN_SENSOR_MAPS[sensor]
+                self._dev.set_switch(sw=0, sw_map=map0)
+                self._dev.set_switch(sw=1, sw_map=map1)
+                self._log_write(
+                    f"  S{sensor}: all pins disconnected → {vs} mV on drain, "
+                    f"drain maps SW0=0x{map0:02X} SW1=0x{map1:02X}", FG_DIM)
+                self._log_write(f"  Waiting drain settle {settle_s:.0f} s ...", FG_DIM)
+                if not self._sleep_abortable(settle_s):
+                    self._rq.put(("log_warn", "Test Paco aborted during drain settle"))
+                    self._rq.put(("busy_off", None))
+                    return
+                if gnd_active:
+                    grounded = [s for s in range(1, 9) if s != sensor]
+                    self._log_write(
+                        f"  S{sensor} selected → sources to GND: "
+                        + ", ".join(f"S{g}" for g in grounded), CYAN)
+                    try:
+                        vbus = self._dev.get_vbus(0)
+                        self._log_write(
+                            f"  S{sensor} drain voltage (VS bus): {vbus:.4f} V", CYAN)
+                    except Exception as e:
+                        self._log_write(
+                            f"  Could not read the VS bus voltage: {e}", ORANGE)
+                # Stage "iv": single-sensor sweep.
+                if not self._wait_device_idle():
+                    self._rq.put(("log_warn", "Test Paco aborted by user"))
+                    self._rq.put(("busy_off", None))
+                    return
+                self._log_write(f"  Sweeping S{sensor} ...", FG_DIM)
+                self._dev.start_sweep_ex(
+                    vs_mv=vs, vg_start_mv=vg_start, vg_end_mv=vg_end,
+                    vg_step_mv=vg_step, sensors=self._sensor_mask([sensor]),
+                    reverse=reverse, repetitions=1, parallel=False)
+                self._wait_sweeping()
+                records = self._stream_records("iv", RecordType.SWEEP_POINT,
+                                               RecordType.SWEEP_END)
+                if records is None:
+                    self._rq.put(("log_warn", "Test Paco aborted by user"))
+                    self._rq.put(("busy_off", None))
+                    return
+                pts = [r for r in records if r["type"] == RecordType.SWEEP_POINT]
+                for r in pts:
+                    r["sensor"] = sensor
+                    r["rep"] = kept_rep
+                self._check_vg_end_reached(pts, vg_end, label=f"S{sensor}: ")
+                self._log_write(
+                    f"    S{sensor}: {len(pts)} points"
+                    + ("  (discarded)" if is_discard else ""),
+                    FG_DIM if is_discard else GREEN)
+                if not is_discard:
+                    kept.extend(pts)
+                # Stage "vd_con_apply": drain back to 0 V and ALL drains
+                # connected → every drain grounded until the next sensor.
+                self._dev.set_voltage(dac=1, out=0, mv=0)
+                self._dev.set_voltage(dac=1, out=1, mv=0)
+                self._dev.set_switch(sw=0, sw_map=0xFF)
+                self._dev.set_switch(sw=1, sw_map=0xFF)
+                self._log_write(
+                    "  All drains grounded again (0 V, SW0/SW1 = 0xFF)", FG_DIM)
+        # Stage "out": restore the classic unselected-source mode.
+        if gnd_active:
+            try:
+                self._dev.set_unsel_mode(UnselMode.OPEN)
+                self._log_write("Unselected-source mode restored to OPEN", FG_DIM)
+            except Exception:
+                pass
+        self._log_write("Finish", GREEN)
+        meta = {
+            "timestamp": timestamp, "vs_mv": vs, "vg_start_mv": vg_start,
+            "vg_end_mv": vg_end, "vg_step_mv": vg_step, "reps": reps,
+            "reverse": reverse,
+        }
+        self._rq.put(("meas_done", {
+            "type": "test_paco", "records": kept, "result": None, "meta": meta,
+            "n_sensors": len(sensors_list), "n_reps": reps,
+        }))
     def _on_measurement_complete(self, data) -> None:
         """Callback when a measurement completes"""
         meas_type = data["type"]
@@ -1875,13 +2264,14 @@ class GratmaApp:
             if result is not None:
                 self._meas_result_lbl.config(text=f"VG_min = {result:.4f} V")
             self._log_write(f"I-V completed — {len(data['records'])} points", GREEN)
-        elif meas_type == "iv_random":
+        elif meas_type in ("iv_random", "test_paco"):
             self._sweep_records = data["records"]
             n_sensors = data.get("n_sensors", "?")
             n_reps = data.get("n_reps", "?")
+            name = "Test Paco" if meas_type == "test_paco" else "Random I-V"
             self._meas_result_lbl.config(text=f"{n_sensors} sensors × {n_reps} reps")
             self._log_write(
-                f"Random I-V completed — {len(data['records'])} points "
+                f"{name} completed — {len(data['records'])} points "
                 f"({n_reps} reps kept per sensor)", GREEN)
         elif meas_type == "idt":
             self._idt_records = data["records"]
@@ -1896,6 +2286,10 @@ class GratmaApp:
         self._last_meas_data = data
         self._btn_export_meas.config(state=NORMAL)
         self._set_busy(False)
+        # The measurement produced its final result; the recovery file is
+        # still 'needed' until the data is actually exported to CSV.
+        if self._recorder:
+            self._recorder.meas_done(saved=False)
         # Auto-save in the output folder (if one is configured)
         if self._out_folder.get().strip():
             self._export_measurement_files(data, auto=True)
@@ -2104,6 +2498,8 @@ class GratmaApp:
                 written = self._export_iv_phase(data["records"], "iv", data.get("meta"))
             elif meas_type == "iv_random":
                 written = self._export_iv_phase(data["records"], "iv-rnd", data.get("meta"))
+            elif meas_type == "test_paco":
+                written = self._export_iv_phase(data["records"], "paco", data.get("meta"))
             elif meas_type == "differential":
                 written = self._export_iv_phase(data["phase1"], "diff-ph1", data.get("meta1"))
                 written += self._export_iv_phase(data["phase2"], "diff-ph2", data.get("meta2"))
@@ -2131,10 +2527,15 @@ class GratmaApp:
                     f"{prefix}: {len(written)} CSV in {self._out_folder.get().strip()}", GREEN)
                 for p in written:
                     self._log_write(f"  → {os.path.basename(p)}", FG_DIM)
+                # Data is safely on disk → the recovery file is expendable.
+                if self._recorder:
+                    self._recorder.export_ok()
             else:
                 self._log_write("No data to export", ORANGE)
         except Exception as e:
             self._log_write(f"Error saving CSV: {e}", RED)
+            if self._recorder:
+                self._recorder.keep("CSV export failed")
     # -- GRATMA Control -------------------------------------------------------
     def _on_set_vs(self) -> None:
         try:
@@ -2249,8 +2650,20 @@ class GratmaApp:
 # Entry point
 # ---------------------------------------------------------------------------
 def main():
-    root = Tk()
-    app = GratmaApp(root)
-    root.mainloop()
+    # Start recording the terminal BEFORE anything else, so even an error
+    # while building the GUI is captured in the recovery file.
+    recorder = TerminalRecorder()
+    try:
+        root = Tk()
+        app = GratmaApp(root, recorder)
+        root.mainloop()
+    except Exception:
+        recorder.keep("unhandled exception in the main loop")
+        traceback.print_exc()
+        raise
+    finally:
+        # Deletes the recovery .txt only if everything finished correctly;
+        # otherwise it is kept so the measurements can be recovered from it.
+        recorder.close()
 if __name__ == "__main__":
     main()
