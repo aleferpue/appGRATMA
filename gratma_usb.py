@@ -104,6 +104,7 @@ class Cmd:
     SET_VREF         = 0x11
     SET_GAIN         = 0x12
     SET_SWITCH       = 0x13
+    SET_UNSEL_MODE   = 0x14   # USB_VENDOR_CMD_SET_UNSEL_MODE — Payload: [u8 mode] 0=open, 1=GND
     GET_VBUS         = 0x20
     GET_VSHUNT       = 0x21
     GET_TEMP         = 0x22
@@ -126,6 +127,14 @@ class DeviceStatus:
     IDLE     = 0x00
     SWEEPING = 0x01
     ERROR    = 0x02
+
+# ---------------------------------------------------------------------------
+# Modo de los sources NO seleccionados durante una medida secuencial
+# (USB_VENDOR_CMD_SET_UNSEL_MODE, 0x14)
+# ---------------------------------------------------------------------------
+class UnselMode:
+    OPEN = 0x00   # comportamiento clásico: sources no seleccionados al aire
+    GND  = 0x01   # sources no seleccionados conectados a tierra
 
 # ---------------------------------------------------------------------------
 # Tipos de registro de datos de medición
@@ -500,6 +509,25 @@ class GratmaUSB:
         """
         payload = struct.pack("<BB", sw, sw_map & 0xFF)
         self._cmd(Cmd.SET_SWITCH, payload)
+
+    def set_unsel_mode(self, mode: int) -> None:
+        """
+        Configura qué se hace con los sources NO seleccionados durante una
+        medida secuencial (USB_VENDOR_CMD_SET_UNSEL_MODE, 0x14).
+
+        Args:
+            mode: UnselMode.OPEN (0) = comportamiento clásico, sources al aire.
+                  UnselMode.GND  (1) = los sources no seleccionados se
+                                       conectan a tierra mientras se mide
+                                       el sensor seleccionado.
+
+        El modo queda memorizado en el firmware y se aplica en cada cambio
+        de sensor de los sweeps/IDT secuenciales posteriores, hasta que se
+        vuelva a cambiar.
+        """
+        if mode not in (UnselMode.OPEN, UnselMode.GND):
+            raise GratmaError(f"Modo UNSEL inválido: {mode} (0=open, 1=GND)")
+        self._cmd(Cmd.SET_UNSEL_MODE, bytes([mode & 0xFF]))
 
     # -- Lecturas de instrumentos (asíncronas en firmware) ------------------
 
