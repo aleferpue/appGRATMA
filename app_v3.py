@@ -1,5 +1,18 @@
 """
-app_v4.py — GRATMA v3.1.0 Desktop Application (tkinter + matplotlib)
+app_v4.py — GRATMA v3.2.0 Desktop Application (tkinter + matplotlib)
+
+Improvements v3.2.0:
+    - New "GND unselected" checkbox (next to "Random", I-V Randomised type):
+      when checked, the firmware is put in UNSEL_MODE=GND (vendor cmd 0x14,
+      USB_VENDOR_CMD_SET_UNSEL_MODE) so every time the measurement switches
+      to a new sensor, all the non-selected sources are tied to ground
+      instead of left floating (classic behaviour). The log console reports
+      which sources are grounded and the drain voltage of the sensor being
+      measured.
+    - VG end is now checked: if (VG end - VG start) is not a multiple of the
+      step, the app logs the shortened final step and verifies after each
+      sweep that VG end was actually measured (requires firmware with the
+      final-step clamp).
 
 Improvements v3.1.0:
     - New "I-V Randomised" measurement type: connect all channels @0V,
@@ -36,7 +49,6 @@ from tkinter import (
     BOTH, DISABLED, END, INSERT, NORMAL, X, Y, BooleanVar, Canvas, Frame,
     Label, StringVar, Text, Tk, Button, filedialog, messagebox, ttk, Toplevel,
 )
-
 import numpy as np
 import usb.core as _usb_core
 import matplotlib
@@ -44,15 +56,14 @@ matplotlib.use("TkAgg")
 import matplotlib.cm as _mpl_cm
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
-
 from gratma_usb import (
     DeviceStatus,
     GratmaDeviceBusy,
     GratmaError,
     GratmaUSB,
     RecordType,
+    UnselMode,
 )
-
 # ---------------------------------------------------------------------------
 # Color palette (industrial dark theme)
 # ---------------------------------------------------------------------------
@@ -68,9 +79,7 @@ YELLOW = "#f9e2af"
 CYAN   = "#89dceb"
 MAGENTA= "#cba6f7"
 PAD    = 6
-
 PING_INTERVAL_MS = 2500  # Send PING every 2.5 seconds
-
 # Base color for each sensor (dark tones; lighter variants are
 # generated with _tint to distinguish forward/backward and phase 1/phase 2)
 SENSOR_COLORS = [
@@ -83,18 +92,15 @@ SENSOR_COLORS = [
     "#f59f00",  # S7 yellow
     "#d6336c",  # S8 pink
 ]
-
-
 # ---------------------------------------------------------------------------
 # Main Application
 # ---------------------------------------------------------------------------
 class GratmaApp:
     def __init__(self, root: Tk) -> None:
         self.root = root
-        self.root.title("GRATMA v3.1.0 — Control & Measurement")
+        self.root.title("GRATMA v3.2.0 — Control & Measurement")
         self.root.configure(bg=BG)
         self.root.minsize(1100, 750)
-
         self._dev: GratmaUSB | None = None
         self._busy = False
         self._rq: queue.Queue = queue.Queue()
@@ -106,13 +112,13 @@ class GratmaApp:
         self._last_meas_data: dict | None = None  # Last completed measurement (for export)
         self._last_export_files: list[str] = []  # CSVs written by the last export (for Data Analysis)
         self._da_curves: list[tuple] = []  # loaded (v_fwd, i_fwd, v_bwd, i_bwd) tuples
+        self._da_curve_sensors: list[int] = []  # 1-based sensor of each loaded curve
         self._da_files: list[str] = []
         self._continuous_job: str | None = None
         self._ping_job: str | None = None
         self._ping_active = False
         self._realtime_job: str | None = None
         self._abort_measurement = False  # Flag to abort measurements
-
         # Accumulated points from the current measurement, for the real-time
         # graph on the Measurements tab. Key: (phase, sensor) where phase is
         # 0 (simple measurement) or 1/2 (differential). Value: ordered list of
@@ -121,12 +127,10 @@ class GratmaApp:
         # line exactly where the sweep switches forward <-> backward.
         self._rt_series: dict[tuple[int, int], list[tuple[float, float, bool]]] = {}
         self._rt_kind = "iv"  # iv | idt | differential | manual
-
         self._apply_style()
         self._build_ui()
         self._update_conn_state(connected=False)
         self._poll()
-
     # -----------------------------------------------------------------------
     # ttk Style
     # -----------------------------------------------------------------------
@@ -159,48 +163,38 @@ class GratmaApp:
         s.configure("Horizontal.TProgressbar",
                     background=ACCENT, troughcolor=BG2, borderwidth=0)
         s.configure("TRadiobutton", background=BG, foreground=FG)
-
     # -----------------------------------------------------------------------
     # Main Layout
     # -----------------------------------------------------------------------
     def _build_ui(self) -> None:
         self._build_conn_bar()
-
         self._nb = ttk.Notebook(self.root)
         self._nb.pack(fill=BOTH, expand=True, padx=PAD, pady=(2, PAD))
-
         self._build_tab_connection()
         self._build_tab_measurements()
         self._build_tab_gratma_control()
         self._build_tab_data_analysis()
-
         self._build_log()
         self._scan_devices()
-
     # -----------------------------------------------------------------------
     # Connection Bar (top)
     # -----------------------------------------------------------------------
     def _build_conn_bar(self) -> None:
         bar = Frame(self.root, bg=BG2, pady=7)
         bar.pack(fill=X)
-
         self._conn_led = Label(bar, text="●", font=("Segoe UI", 13),
                                bg=BG2, fg=RED)
         self._conn_led.pack(side="left", padx=(12, 4))
-
         self._conn_label = Label(bar, text="Disconnected",
                                  bg=BG2, fg=FG_DIM, font=("Segoe UI", 9))
         self._conn_label.pack(side="left", padx=(0, 8))
-
         # Ping-pong indicator
         self._ping_led = Label(bar, text="○", font=("Segoe UI", 10),
                                bg=BG2, fg=FG_DIM)
         self._ping_led.pack(side="left", padx=(8, 4))
-
         self._ping_label = Label(bar, text="Ping-Pong: Inactive",
                                  bg=BG2, fg=FG_DIM, font=("Segoe UI", 8))
         self._ping_label.pack(side="left", padx=(0, 12))
-
         self._btn_connect = Button(
             bar, text="Connect", width=13, command=self._on_connect,
             bg=ACCENT, fg=BG, relief="flat",
@@ -208,7 +202,6 @@ class GratmaApp:
             font=("Segoe UI", 9, "bold"),
         )
         self._btn_connect.pack(side="left", padx=4)
-
         # Device selector
         Label(bar, text="  Device:", bg=BG2, fg=FG_DIM,
               font=("Segoe UI", 9)).pack(side="left", padx=(8, 4))
@@ -225,34 +218,28 @@ class GratmaApp:
             font=("Segoe UI", 10),
         )
         self._btn_scan.pack(side="left", padx=(0, 8))
-
         Label(bar, text="  Status:", bg=BG2, fg=FG_DIM,
               font=("Segoe UI", 9)).pack(side="left", padx=(16, 4))
         self._dev_status_lbl = Label(bar, text="—", bg=BG2, fg=FG_DIM,
                                      font=("Segoe UI", 9, "bold"))
         self._dev_status_lbl.pack(side="left")
-
         # Progress bar (right side)
         self._progress = ttk.Progressbar(
             bar, mode="indeterminate", length=120,
             style="Horizontal.TProgressbar",
         )
         self._progress.pack(side="right", padx=(0, 16))
-
     # -----------------------------------------------------------------------
     # Tab 1: Connection
     # -----------------------------------------------------------------------
     def _build_tab_connection(self) -> None:
         tab = Frame(self._nb, bg=BG)
         self._nb.add(tab, text="  Connection  ")
-
         # Connection status
         conn_frame = ttk.LabelFrame(tab, text="Connection Status", padding=16)
         conn_frame.pack(fill=X, padx=PAD * 3, pady=(PAD * 2, PAD))
-
         info_grid = Frame(conn_frame, bg=BG)
         info_grid.pack(fill=X)
-
         labels = [
             ("USB Device:", "_info_device"),
             ("Bus/Address:", "_info_bus"),
@@ -261,7 +248,6 @@ class GratmaApp:
             ("System Status:", "_info_system_status"),
             ("USB Mode:", "_info_usb_mode"),
         ]
-
         for i, (lbl, attr) in enumerate(labels):
             Label(info_grid, text=lbl, bg=BG, fg=FG_DIM,
                   font=("Segoe UI", 9), anchor="e", width=18).grid(
@@ -271,11 +257,9 @@ class GratmaApp:
             Label(info_grid, textvariable=var, bg=BG, fg=YELLOW,
                   font=("Consolas", 10), anchor="w").grid(
                 row=i, column=1, sticky="w", pady=4)
-
         # Manual ping
         ping_frame = ttk.LabelFrame(tab, text="Communication Test", padding=16)
         ping_frame.pack(fill=X, padx=PAD * 3, pady=PAD)
-
         self._btn_ping = Button(
             ping_frame, text="▶  Manual Ping", command=self._on_ping,
             bg=GREEN, fg=BG, relief="flat",
@@ -283,10 +267,8 @@ class GratmaApp:
             font=("Segoe UI", 10, "bold"), state=DISABLED, width=20,
         )
         self._btn_ping.pack(pady=8)
-
         Label(ping_frame, text="Automatic ping runs every 2.5s when connected",
               bg=BG, fg=FG_DIM, font=("Segoe UI", 8)).pack(pady=(0, 4))
-
     # -----------------------------------------------------------------------
     # Tab 2: Measurements
     # -----------------------------------------------------------------------
@@ -296,42 +278,33 @@ class GratmaApp:
         outer = Frame(parent, bg=BG, width=width)
         outer.pack(side="left", fill=Y, padx=(PAD, 0), pady=PAD)
         outer.pack_propagate(False)
-
         canvas = Canvas(outer, bg=BG, highlightthickness=0)
         vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill=Y)
         canvas.pack(side="left", fill=BOTH, expand=True)
-
         inner = Frame(canvas, bg=BG)
         win = canvas.create_window((0, 0), window=inner, anchor="nw")
-
         # Keep scrollregion at content size and inner frame width equal to canvas.
         canvas.bind("<Configure>",
                     lambda e: canvas.itemconfigure(win, width=e.width))
         inner.bind("<Configure>",
                    lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-
         # Mouse wheel (only when pointer is over this panel)
         def _wheel(e):
             canvas.yview_scroll(int(-e.delta / 120), "units")
         canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _wheel))
         canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
-
         return inner
-
     def _build_tab_measurements(self) -> None:
         tab = Frame(self._nb, bg=BG)
         self._nb.add(tab, text="  Measurements  ")
-
         # Left panel: scrollable so all controls are accessible
         # even if the window is small.
         left = self._make_scrollable_panel(tab, width=320)
-
         # Type selector
         type_frame = ttk.LabelFrame(left, text="Measurement Type", padding=12)
         type_frame.pack(fill=X, pady=(0, 6))
-
         self._meas_type = StringVar(value="iv_parametric")
         types = [
             ("iv_parametric", "I-V Parametric"),
@@ -339,28 +312,22 @@ class GratmaApp:
             ("differential", "Differential Two Points"),
             ("iv_randomised", "I-V Randomised"),
         ]
-
         for val, lbl in types:
             ttk.Radiobutton(type_frame, text=lbl, variable=self._meas_type,
                             value=val, command=self._on_meas_type_change).pack(
                 anchor="w", pady=2)
-
         # Sample identification and output folder (common to all types)
         self._build_identification(left)
-
         # Sensor selection and mode (common to all types)
         self._build_sensor_selection(left)
-
         # Parameter frames (shown/hidden according to type)
         self._meas_params_frame = Frame(left, bg=BG)
         self._meas_params_frame.pack(fill=BOTH, expand=True, pady=(0, 6))
-
         self._build_meas_params()
-
         # Start and stop buttons
         btn_frame = Frame(left, bg=BG)
         btn_frame.pack(fill=X, pady=(0, 6))
-        
+
         self._btn_start_meas = Button(
             btn_frame, text="▶  Start", command=self._on_start_measurement,
             bg=GREEN, fg=BG, relief="flat",
@@ -368,7 +335,7 @@ class GratmaApp:
             font=("Segoe UI", 10, "bold"), state=DISABLED, height=2,
         )
         self._btn_start_meas.pack(side="left", fill=X, expand=True, padx=(0, 3))
-        
+
         self._btn_stop_meas = Button(
             btn_frame, text="⬛  STOP", command=self._on_stop_measurement,
             bg=RED, fg=BG, relief="flat",
@@ -376,14 +343,12 @@ class GratmaApp:
             font=("Segoe UI", 10, "bold"), state=DISABLED, height=2,
         )
         self._btn_stop_meas.pack(side="left", fill=X, expand=True)
-
         # Result
         res_frame = ttk.LabelFrame(left, text="Result", padding=10)
         res_frame.pack(fill=X, pady=(0, 6))
         self._meas_result_lbl = Label(res_frame, text="—", bg=BG, fg=YELLOW,
                                       font=("Consolas", 14, "bold"))
         self._meas_result_lbl.pack(anchor="w")
-
         # Export
         self._btn_export_meas = Button(
             left, text="Export CSV", command=self._on_export_measurement,
@@ -391,42 +356,34 @@ class GratmaApp:
             font=("Segoe UI", 9), state=DISABLED,
         )
         self._btn_export_meas.pack(fill=X)
-
         # Right panel: Real-time graph
         right = Frame(tab, bg=BG)
         right.pack(side="left", fill=BOTH, expand=True, padx=PAD, pady=PAD)
-
         Label(right, text="Preview (Real-time)", bg=BG, fg=ACCENT,
               font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 4))
-
         self._meas_fig = Figure(facecolor=BG, figsize=(7, 5))
         self._meas_ax = self._meas_fig.add_subplot(111)
         self._setup_axes(self._meas_ax, "Ongoing Measurement", "$V_G$ (V)", "$I_{DS}$ (µA)")
-
         self._meas_canvas = FigureCanvasTkAgg(self._meas_fig, master=right)
         self._meas_canvas.get_tk_widget().pack(fill=BOTH, expand=True)
         tb = NavigationToolbar2Tk(self._meas_canvas, right, pack_toolbar=False)
         tb.update()
         tb.pack(fill=X)
         self._style_toolbar(tb)
-
     def _build_identification(self, parent) -> None:
         """Sample name, extra text and output folder (common to all measurements)."""
         frame = ttk.LabelFrame(parent, text="Identification / Output", padding=10)
         frame.pack(fill=X, pady=(0, 6))
-
         Label(frame, text="Sample ID:", bg=BG, fg=FG_DIM,
               font=("Segoe UI", 9)).grid(row=0, column=0, sticky="w", pady=2, padx=(0, 8))
         self._sample_name = StringVar(value="sample")
         ttk.Entry(frame, textvariable=self._sample_name, width=16).grid(
             row=0, column=1, columnspan=2, sticky="we", pady=2)
-
         Label(frame, text="Extra:", bg=BG, fg=FG_DIM,
               font=("Segoe UI", 9)).grid(row=1, column=0, sticky="w", pady=2, padx=(0, 8))
         self._extra_text = StringVar(value="")
         ttk.Entry(frame, textvariable=self._extra_text, width=16).grid(
             row=1, column=1, columnspan=2, sticky="we", pady=2)
-
         Label(frame, text="Folder:", bg=BG, fg=FG_DIM,
               font=("Segoe UI", 9)).grid(row=2, column=0, sticky="w", pady=2, padx=(0, 8))
         self._out_folder = StringVar(value="")
@@ -434,18 +391,15 @@ class GratmaApp:
             row=2, column=1, sticky="we", pady=2)
         Button(frame, text="…", width=2, command=self._on_pick_folder,
                bg=BG2, fg=FG, relief="flat").grid(row=2, column=2, padx=(4, 0))
-
         Label(frame, text="CSVs are saved automatically when finished\n"
               "as <sample>_<sensor>_<type>_<rep>_<extra>.csv",
               bg=BG, fg=FG_DIM, font=("Segoe UI", 7, "italic"), justify="left").grid(
             row=3, column=0, columnspan=3, sticky="w", pady=(4, 0))
         frame.grid_columnconfigure(1, weight=1)
-
     def _build_sensor_selection(self, parent) -> None:
         """Checkboxes for sensors 1-8 + sequential/parallel mode (common to I-V and IDT)."""
         frame = ttk.LabelFrame(parent, text="Sensors", padding=10)
         frame.pack(fill=X, pady=(0, 6))
-
         self._sensor_vars: list[BooleanVar] = []
         checks = Frame(frame, bg=BG)
         checks.pack(fill=X)
@@ -454,7 +408,6 @@ class GratmaApp:
             self._sensor_vars.append(var)
             ttk.Checkbutton(checks, text=f"S{i + 1}", variable=var).grid(
                 row=i // 4, column=i % 4, sticky="w", padx=4, pady=2)
-
         mode_row = Frame(frame, bg=BG)
         mode_row.pack(fill=X, pady=(6, 0))
         self._sensor_mode = StringVar(value="sequential")
@@ -468,30 +421,38 @@ class GratmaApp:
         self._random_mode = BooleanVar(value=True)
         self._random_check = ttk.Checkbutton(mode_row, text="Random",
                                              variable=self._random_mode)
+        # GND-unselected checkbox: only shown for the "I-V Randomised" type,
+        # right next to Random. When checked, the firmware is put in
+        # UNSEL_MODE=GND (vendor cmd 0x14) so that on every sensor change all
+        # the NON-selected sources are tied to ground instead of left open.
+        self._gnd_unselected = BooleanVar(value=False)
+        self._gnd_check = ttk.Checkbutton(mode_row, text="GND unselected",
+                                          variable=self._gnd_unselected)
         self._mode_hint = Label(
             frame, text="Parallel: all sensors at once. Sequential: one after another.",
             bg=BG, fg=FG_DIM, font=("Segoe UI", 7, "italic"), justify="left")
         self._mode_hint.pack(anchor="w", pady=(2, 0))
-
     def _update_sensor_mode_widgets(self) -> None:
         """Swaps the Parallel radio for the Random checkbox in randomised mode."""
         if self._meas_type.get() == "iv_randomised":
             self._par_radio.pack_forget()
             self._sensor_mode.set("sequential")  # parallel not allowed here
             self._random_check.pack(side="left", padx=(16, 0))
+            self._gnd_check.pack(side="left", padx=(10, 0))
             self._mode_hint.config(
                 text="Random: alternates a random sensor from the top group (1-4) and\n"
-                     "the bottom group (5-8). Uncheck for plain sequential order.")
+                     "the bottom group (5-8). Uncheck for plain sequential order.\n"
+                     "GND unselected: while a sensor is measured, every other source\n"
+                     "is tied to ground (firmware cmd 0x14; unchecked = left open).")
         else:
             self._random_check.pack_forget()
+            self._gnd_check.pack_forget()
             self._par_radio.pack(side="left")
             self._mode_hint.config(
                 text="Parallel: all sensors at once. Sequential: one after another.")
-
     def _selected_sensors(self) -> list[int]:
         """List of selected sensors (1-based)."""
         return [i + 1 for i, v in enumerate(self._sensor_vars) if v.get()]
-
     def _build_meas_params(self) -> None:
         """Builds parameter frames for each measurement type"""
         # Parametric I-V frame (also used by differential)
@@ -506,7 +467,6 @@ class GratmaApp:
         ttk.Checkbutton(self._params_iv_param, text="Reverse sweep",
                         variable=self._iv_reverse).grid(
             row=5, column=0, columnspan=2, sticky="w", pady=(6, 2))
-
         # IDT frame
         self._params_idt = ttk.LabelFrame(self._meas_params_frame,
                                           text="IDT Parameters", padding=10)
@@ -514,7 +474,6 @@ class GratmaApp:
         self._idt_vs = self._entry_row(self._params_idt, "VS (mV):", 100, 1)
         self._idt_total = self._entry_row(self._params_idt, "Duration (s):", 10, 2)
         self._idt_period = self._entry_row(self._params_idt, "Period (s):", 1, 3)
-
         # Differential frame: reuses I-V parameters (same in both phases)
         self._params_diff = Frame(self._meas_params_frame, bg=BG)
         Label(self._params_diff, text="Two phases (baseline / with sample), each is\n"
@@ -523,7 +482,6 @@ class GratmaApp:
               bg=BG, fg=FG_DIM, font=("Segoe UI", 9), justify="left").pack(pady=(12, 4))
         Label(self._params_diff, text="⚠ Requires manual intervention between phases",
               bg=BG, fg=ORANGE, font=("Segoe UI", 8, "italic")).pack(pady=(0, 8))
-
         # Randomised frame: reuses the I-V panel for the curve parameters and
         # adds the stabilization/settle timings and how many initial measures
         # to discard. The number of measures kept per sensor is the
@@ -543,17 +501,14 @@ class GratmaApp:
                    "Recommended curve: VS=50, VG 0→1200, step=15, Reverse ON.",
               bg=BG, fg=FG_DIM, font=("Segoe UI", 7, "italic"), justify="left").grid(
             row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
-
         # Show IV Parametric frame by default
         self._on_meas_type_change()
-
     def _on_meas_type_change(self) -> None:
         """Shows/hides parameter frames according to selected type"""
         # Hide all
         for frame in [self._params_iv_param, self._params_idt, self._params_diff,
                       self._params_random]:
             frame.pack_forget()
-
         # Show selected (differential and randomised reuse the I-V panel)
         meas_type = self._meas_type.get()
         if meas_type == "iv_parametric":
@@ -566,31 +521,25 @@ class GratmaApp:
         elif meas_type == "iv_randomised":
             self._params_iv_param.pack(fill=X, pady=6)
             self._params_random.pack(fill=X, pady=6)
-
         # Swap Parallel radio <-> Random checkbox depending on the type
         self._update_sensor_mode_widgets()
-
     def _on_pick_folder(self) -> None:
         folder = filedialog.askdirectory(title="Output folder for CSV files")
         if folder:
             self._out_folder.set(folder)
-
     # -----------------------------------------------------------------------
     # Tab 3: GRATMA Control
     # -----------------------------------------------------------------------
     def _build_tab_gratma_control(self) -> None:
         tab = Frame(self._nb, bg=BG)
         self._nb.add(tab, text="  GRATMA  ")
-
         # Left panel: Controls
         left = Frame(tab, bg=BG, width=380)
         left.pack(side="left", fill=Y, padx=(PAD, 0), pady=PAD)
         left.pack_propagate(False)
-
         # High-Level VS/VG Control
         hl_frame = ttk.LabelFrame(left, text="High-Level Control (VS / VG)", padding=12)
         hl_frame.pack(fill=X, pady=(0, 8))
-
         Label(hl_frame, text="VS (mV):", bg=BG, fg=FG_DIM, font=("Segoe UI", 9)).grid(
             row=0, column=0, sticky="w", pady=4, padx=(0, 8))
         self._hl_vs = StringVar(value="0")
@@ -600,7 +549,6 @@ class GratmaApp:
             hl_frame, text="Set VS", command=self._on_set_vs,
             bg=ACCENT, fg=BG, relief="flat", font=("Segoe UI", 9), state=DISABLED)
         self._btn_set_vs.grid(row=0, column=2, padx=(8, 0))
-
         Label(hl_frame, text="VG (mV):", bg=BG, fg=FG_DIM, font=("Segoe UI", 9)).grid(
             row=1, column=0, sticky="w", pady=4, padx=(0, 8))
         self._hl_vg = StringVar(value="0")
@@ -610,105 +558,84 @@ class GratmaApp:
             hl_frame, text="Set VG", command=self._on_set_vg,
             bg=ACCENT, fg=BG, relief="flat", font=("Segoe UI", 9), state=DISABLED)
         self._btn_set_vg.grid(row=1, column=2, padx=(8, 0))
-
         Label(hl_frame, text="Note: The firmware calculates the necessary DAC values",
               bg=BG, fg=FG_DIM, font=("Segoe UI", 7, "italic")).grid(
             row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
-
         # Raw DAC Control
         dac_frame = ttk.LabelFrame(left, text="Raw DAC Control", padding=12)
         dac_frame.pack(fill=X, pady=(0, 8))
-
         Label(dac_frame, text="DAC:", bg=BG, fg=FG_DIM, font=("Segoe UI", 9)).grid(
             row=0, column=0, padx=4, sticky="w")
         self._dac_idx = StringVar(value="0 (VG)")
         ttk.Combobox(dac_frame, textvariable=self._dac_idx, width=10,
                      values=["0 (VG)", "1 (VS)"], state="readonly").grid(
             row=0, column=1, padx=4)
-
         Label(dac_frame, text="Channel:", bg=BG, fg=FG_DIM, font=("Segoe UI", 9)).grid(
             row=0, column=2, padx=4, sticky="w")
         self._dac_out = StringVar(value="0")
         ttk.Combobox(dac_frame, textvariable=self._dac_out, width=5,
                      values=["0", "1"], state="readonly").grid(
             row=0, column=3, padx=4)
-
         Label(dac_frame, text="mV:", bg=BG, fg=FG_DIM, font=("Segoe UI", 9)).grid(
             row=0, column=4, padx=4, sticky="w")
         self._dac_mv = StringVar(value="0")
         ttk.Entry(dac_frame, textvariable=self._dac_mv, width=8).grid(
             row=0, column=5, padx=4)
-
         self._btn_set_voltage = Button(
             dac_frame, text="Set Voltage", command=self._on_set_voltage,
             bg=ACCENT, fg=BG, relief="flat", font=("Segoe UI", 9), state=DISABLED)
         self._btn_set_voltage.grid(row=0, column=6, padx=(12, 0))
-
         # Switch Control
         sw_frame = ttk.LabelFrame(left, text="Switch Control (MAX14662)", padding=12)
         sw_frame.pack(fill=X, pady=(0, 8))
-
         Label(sw_frame, text="Switch:", bg=BG, fg=FG_DIM, font=("Segoe UI", 9)).grid(
             row=0, column=0, padx=4, sticky="w")
         self._sw_idx = StringVar(value="0")
         ttk.Combobox(sw_frame, textvariable=self._sw_idx, width=5,
                      values=["0", "1"], state="readonly").grid(
             row=0, column=1, padx=4)
-
         Label(sw_frame, text="Map (hex):", bg=BG, fg=FG_DIM, font=("Segoe UI", 9)).grid(
             row=0, column=2, padx=4, sticky="w")
         self._sw_map_var = StringVar(value="0xFF")
         ttk.Entry(sw_frame, textvariable=self._sw_map_var, width=8).grid(
             row=0, column=3, padx=4)
-
         self._btn_set_switch = Button(
             sw_frame, text="Set Switch", command=self._on_set_switch,
             bg=ACCENT, fg=BG, relief="flat", font=("Segoe UI", 9), state=DISABLED)
         self._btn_set_switch.grid(row=0, column=4, padx=(12, 0))
-
         # Status
         stat_frame = ttk.LabelFrame(left, text="System Status", padding=12)
         stat_frame.pack(fill=X, pady=(0, 8))
-
         self._btn_get_status = Button(
             stat_frame, text="Read Status", command=self._on_get_status,
             bg=BG2, fg=FG, relief="flat", font=("Segoe UI", 9), state=DISABLED)
         self._btn_get_status.pack(side="left", padx=(0, 14))
-
         self._man_status_lbl = Label(stat_frame, text="—", bg=BG, fg=YELLOW,
                                      font=("Segoe UI", 11, "bold"))
         self._man_status_lbl.pack(side="left")
-
         # Right panel: Instrument readings
         right = Frame(tab, bg=BG)
         right.pack(side="left", fill=BOTH, expand=True, padx=PAD, pady=PAD)
-
         Label(right, text="Instrument Readings (INA228)", bg=BG, fg=ACCENT,
               font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 8))
-
         ctrl = Frame(right, bg=BG)
         ctrl.pack(fill=X, pady=(0, 12))
-
         self._btn_instr_refresh = Button(
             ctrl, text="↺  Read All", command=self._on_read_instruments,
             bg=ACCENT, fg=BG, relief="flat",
             font=("Segoe UI", 9, "bold"), state=DISABLED)
         self._btn_instr_refresh.pack(side="left", padx=(0, 14))
-
         self._instr_continuous = BooleanVar(value=False)
         ttk.Checkbutton(ctrl, text="Continuous", variable=self._instr_continuous,
                         command=self._on_continuous_toggle).pack(side="left")
-
         Label(ctrl, text="  Interval (s):", bg=BG, fg=FG_DIM,
               font=("Segoe UI", 9)).pack(side="left")
         self._instr_interval = StringVar(value="1.0")
         ttk.Entry(ctrl, textvariable=self._instr_interval, width=6).pack(
             side="left", padx=(4, 0))
-
         # Grid de lecturas
         grid = Frame(right, bg=BG2, padx=20, pady=16)
         grid.pack(fill=X)
-
         READINGS = [
             ("ina0_vbus", "INA228[0] Vbus:", "V"),
             ("ina1_vbus", "INA228[1] Vbus:", "V"),
@@ -718,45 +645,35 @@ class GratmaApp:
             ("ina1_is", "INA228[1] IS (200Ω):", "A"),
             ("ina0_temp", "INA228[0] Temp:", "°C"),
         ]
-
         self._instr_vars: dict[str, StringVar] = {}
-
         for i, (key, lbl, unit) in enumerate(READINGS):
             row = i // 2
             col = (i % 2) * 4
-
             Label(grid, text=lbl, bg=BG2, fg=FG_DIM, font=("Segoe UI", 9),
                   anchor="e").grid(row=row, column=col, sticky="e",
                                    padx=(0, 8), pady=7)
-
             var = StringVar(value="—")
             self._instr_vars[key] = var
             Label(grid, textvariable=var, bg=BG2, fg=YELLOW,
                   font=("Consolas", 12, "bold"), width=14, anchor="w").grid(
                 row=row, column=col + 1, sticky="w")
-
             Label(grid, text=unit, bg=BG2, fg=FG_DIM, font=("Segoe UI", 9)).grid(
                 row=row, column=col + 2, sticky="w", padx=(0, 32))
-
         self._instr_ts_lbl = Label(right, text="", bg=BG, fg=FG_DIM,
                                    font=("Segoe UI", 8))
         self._instr_ts_lbl.pack(anchor="w", pady=(8, 0))
-
     # -----------------------------------------------------------------------
     # Tab 4: Data Analysis
     # -----------------------------------------------------------------------
     def _build_tab_data_analysis(self) -> None:
         tab = Frame(self._nb, bg=BG)
         self._nb.add(tab, text="  Data Analysis  ")
-
         # Left panel: controls
         left = Frame(tab, bg=BG, width=300)
         left.pack(side="left", fill=Y, padx=(PAD, 0), pady=PAD)
         left.pack_propagate(False)
-
         src_frame = ttk.LabelFrame(left, text="Data Source", padding=12)
         src_frame.pack(fill=X, pady=(0, 8))
-
         self._btn_da_last = Button(
             src_frame, text="Represent last measurements",
             command=self._on_da_represent_last,
@@ -764,7 +681,6 @@ class GratmaApp:
             activebackground=FG, activeforeground=BG,
             font=("Segoe UI", 9, "bold"))
         self._btn_da_last.pack(fill=X, pady=(0, 6))
-
         self._btn_da_select = Button(
             src_frame, text="Select files…",
             command=self._on_da_select_files,
@@ -772,12 +688,21 @@ class GratmaApp:
             activebackground=BG, activeforeground=FG,
             font=("Segoe UI", 9))
         self._btn_da_select.pack(fill=X)
-
+        # Sensors to represent: all selected by default; unticking a sensor
+        # excludes its curves from every plot of this tab.
+        sens_frame = ttk.LabelFrame(left, text="Sensors to represent", padding=8)
+        sens_frame.pack(fill=X, pady=(8, 0))
+        self._da_sensor_vars: list[BooleanVar] = []
+        for i in range(8):
+            var = BooleanVar(value=True)
+            self._da_sensor_vars.append(var)
+            ttk.Checkbutton(sens_frame, text=f"S{i + 1}", variable=var,
+                            command=self._da_render).grid(
+                row=i // 4, column=i % 4, sticky="w", padx=4, pady=2)
         self._da_info = StringVar(value="No data loaded")
         Label(left, textvariable=self._da_info, bg=BG, fg=YELLOW,
               font=("Consolas", 9), justify="left", anchor="w",
               wraplength=280).pack(fill=X, pady=(4, 8))
-
         plot_frame = ttk.LabelFrame(left, text="Plot", padding=12)
         plot_frame.pack(fill=X, pady=(0, 8))
         self._da_plot_kind = StringVar(value="Forward curves")
@@ -785,26 +710,25 @@ class GratmaApp:
                     "Mean ± std", "Dirac violin"]:
             ttk.Radiobutton(plot_frame, text=lbl, variable=self._da_plot_kind,
                             value=lbl, command=self._da_render).pack(anchor="w", pady=2)
-
         Label(left,
               text="Each file is treated as one sensor: the first half of the\n"
                    "rows is the forward sweep and the second half the backward\n"
                    "sweep. Currents are shown in µA. Axes auto-scale to the data.",
               bg=BG, fg=FG_DIM, font=("Segoe UI", 7, "italic"),
               justify="left").pack(anchor="w", pady=(4, 0))
-
         self._btn_da_save = Button(
             left, text="Save current plot (PNG)…", command=self._on_da_save_plot,
             bg=BG2, fg=FG, relief="flat", font=("Segoe UI", 9))
         self._btn_da_save.pack(fill=X, pady=(10, 0))
-
+        self._btn_da_save_all = Button(
+            left, text="Save all PNG", command=self._on_da_save_all,
+            bg=BG2, fg=FG, relief="flat", font=("Segoe UI", 9))
+        self._btn_da_save_all.pack(fill=X, pady=(6, 0))
         # Right panel: embedded figure
         right = Frame(tab, bg=BG)
         right.pack(side="left", fill=BOTH, expand=True, padx=PAD, pady=PAD)
-
         Label(right, text="Analysis", bg=BG, fg=ACCENT,
               font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 4))
-
         self._da_fig = Figure(facecolor="white", figsize=(7, 5))
         self._da_canvas = FigureCanvasTkAgg(self._da_fig, master=right)
         self._da_canvas.get_tk_widget().pack(fill=BOTH, expand=True)
@@ -813,7 +737,6 @@ class GratmaApp:
         tb.pack(fill=X)
         self._style_toolbar(tb)
         self._da_render()
-
     # -- Data Analysis: file loading -----------------------------------------
     def _on_da_represent_last(self) -> None:
         files = self._last_export_files
@@ -825,16 +748,15 @@ class GratmaApp:
                 "and then try again — or use 'Select files…'.")
             return
         self._da_load_files(list(files))
-
     def _on_da_select_files(self) -> None:
         paths = filedialog.askopenfilenames(
             title="Select measurement files",
             filetypes=[("Measurement data", "*.csv *.txt"), ("All files", "*.*")])
         if paths:
             self._da_load_files(list(paths))
-
     def _da_load_files(self, paths: list[str]) -> None:
         curves: list[tuple] = []
+        sensors: list[int] = []
         skipped = 0
         for p in paths:
             try:
@@ -852,8 +774,9 @@ class GratmaApp:
                 skipped += 1
                 continue
             curves.append((v[:mid], i_ua[:mid], v[mid:], i_ua[mid:]))
-
+            sensors.append(self._da_sensor_from_filename(p, fallback=len(curves)))
         self._da_curves = curves
+        self._da_curve_sensors = sensors
         self._da_files = paths
         msg = f"{len(curves)} curve(s) loaded"
         if skipped:
@@ -861,25 +784,21 @@ class GratmaApp:
         self._da_info.set(msg)
         self._log_write(f"Data Analysis: {msg}", GREEN if curves else ORANGE)
         self._da_render()
-
     @staticmethod
     def _da_read_curve(path: str):
         """Reads a curve as (Vg, Id) numpy arrays (Id in Amperes).
-
         Handles the app's own CSV export (metadata block followed by a
         'VG_V,IS_A,...' header and comma-separated rows) as well as generic
         two-column text files (whitespace- or comma-separated, with either
         '.' or ',' as the decimal separator)."""
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             lines = f.readlines()
-
         # Locate the app-CSV data header, if present.
         hdr_idx = None
         for idx, line in enumerate(lines):
             if line.strip().lower().replace(" ", "").startswith("vg_v,"):
                 hdr_idx = idx
                 break
-
         vg: list[float] = []
         ids: list[float] = []
         if hdr_idx is not None:
@@ -915,9 +834,22 @@ class GratmaApp:
                     continue
                 vg.append(x)
                 ids.append(y)
-
         return np.asarray(vg, dtype=float), np.asarray(ids, dtype=float)
-
+    @staticmethod
+    def _da_sensor_from_filename(path: str, fallback: int) -> int:
+        """Guesses the 1-based sensor number of a data file from the app's
+        export naming <sample>_<sensor>_<type>_<rep>_<extra>.csv (the sensor
+        token is e.g. '3' or 'S3'). For files that do not follow the pattern,
+        returns 'fallback' (the loading order), wrapped to 1..8."""
+        name = os.path.splitext(os.path.basename(path))[0]
+        for tok in name.split("_")[1:]:
+            t = tok.upper().lstrip("S")
+            if t.isdigit():
+                n = int(t)
+                if 1 <= n <= 8:
+                    return n
+                break  # first numeric token is the sensor slot; give up if out of range
+        return ((fallback - 1) % 8) + 1
     # -- Data Analysis: plotting ---------------------------------------------
     @staticmethod
     def _da_cmap(n: int):
@@ -927,7 +859,6 @@ class GratmaApp:
             return matplotlib.colormaps["tab10"].resampled(n)
         except Exception:  # older matplotlib
             return _mpl_cm.get_cmap("tab10", n)
-
     @staticmethod
     def _da_format_axes(ax, xlabel: str, ylabel: str) -> None:
         """Publication styling: inward ticks on all four sides, bold tick
@@ -944,7 +875,6 @@ class GratmaApp:
             label.set_fontweight("bold")
         ax.set_xlabel(xlabel, fontsize=14, fontweight="bold", labelpad=8)
         ax.set_ylabel(ylabel, fontsize=14, fontweight="bold", labelpad=8)
-
     def _da_render(self) -> None:
         """Draws the currently-selected analysis plot from the loaded curves."""
         kind = self._da_plot_kind.get()
@@ -952,23 +882,26 @@ class GratmaApp:
         fig.clear()
         ax = fig.add_subplot(111)
         ax.set_facecolor("white")
-
-        curves = self._da_curves
+        # Keep only the curves whose sensor is ticked in "Sensors to represent".
+        selected = {i + 1 for i, v in enumerate(self._da_sensor_vars) if v.get()}
+        curves = [c for c, s in zip(self._da_curves, self._da_curve_sensors)
+                  if s in selected]
         xlabel = "Gate Voltage (V)"
         ylabel = "Drain Current (µA)"
-
         if not curves:
-            ax.text(0.5, 0.5, "No data loaded.\nUse the buttons on the left.",
+            empty_msg = ("No data loaded.\nUse the buttons on the left."
+                         if not self._da_curves else
+                         "All sensors are deselected.\n"
+                         "Tick at least one in 'Sensors to represent'.")
+            ax.text(0.5, 0.5, empty_msg,
                     ha="center", va="center", fontsize=13, color="#555555",
                     transform=ax.transAxes)
             ax.set_xticks([]); ax.set_yticks([])
             fig.tight_layout()
             self._da_canvas.draw()
             return
-
         n = len(curves)
         cmap = self._da_cmap(n)
-
         if kind in ("Forward curves", "Backward curves"):
             forward = (kind == "Forward curves")
             for idx, (vf, if_, vb, ib) in enumerate(curves):
@@ -978,22 +911,18 @@ class GratmaApp:
             ax.set_title(f"{'Forward' if forward else 'Backward'} curves "
                          f"({n} sensors)", fontsize=13)
             self._da_format_axes(ax, xlabel, ylabel)
-
         elif kind == "Mean ± std":
             all_v = np.concatenate([np.concatenate([vf, vb])
                                     for vf, if_, vb, ib in curves])
             x_lo, x_hi = float(np.min(all_v)), float(np.max(all_v))
             common_x = np.linspace(x_lo, x_hi, 300)
-
             def interp(vs, is_):
                 order = np.argsort(vs)
                 return np.interp(common_x, np.asarray(vs)[order], np.asarray(is_)[order])
-
             fwd = np.array([interp(vf, if_) for vf, if_, vb, ib in curves])
             bwd = np.array([interp(vb, ib) for vf, if_, vb, ib in curves])
             mean_f, std_f = fwd.mean(axis=0), fwd.std(axis=0)
             mean_b, std_b = bwd.mean(axis=0), bwd.std(axis=0)
-
             ax.plot(common_x, mean_f, color="blue", label="Mean Forward")
             ax.fill_between(common_x, mean_f - std_f, mean_f + std_f,
                             color="blue", alpha=0.3)
@@ -1005,7 +934,6 @@ class GratmaApp:
             leg = ax.legend(fontsize=12, frameon=False)
             for text in leg.get_texts():
                 text.set_fontweight("bold")
-
         elif kind == "Dirac violin":
             dirac_f, dirac_b = [], []
             for vf, if_, vb, ib in curves:
@@ -1042,10 +970,8 @@ class GratmaApp:
                 tick.set_fontweight("bold")
             for spine in ax.spines.values():
                 spine.set_linewidth(2.2)
-
         fig.tight_layout()
         self._da_canvas.draw()
-
     def _on_da_save_plot(self) -> None:
         if not self._da_curves:
             messagebox.showinfo("Data Analysis", "There is no plot to save yet.")
@@ -1060,7 +986,52 @@ class GratmaApp:
             self._log_write(f"Plot saved: {os.path.basename(path)}", GREEN)
         except Exception as e:
             self._log_write(f"Error saving plot: {e}", RED)
-
+    # File-name suffix for each plot type when using "Save all PNG".
+    _DA_SAVE_ALL_SUFFIXES = {
+        "Forward curves": "Forward curves",
+        "Backward curves": "Reverse curves",
+        "Mean ± std": "Mean std",
+        "Dirac violin": "Dirac violin",
+    }
+    def _on_da_save_all(self) -> None:
+        """Saves the four available plots as PNG in the folder of the loaded
+        data files, automatically named as <data name>_<plot type>.png
+        (Forward curves, Reverse curves, Mean std, Dirac violin). The
+        'Sensors to represent' selection is honoured."""
+        if not self._da_curves:
+            messagebox.showinfo("Data Analysis", "There is no data loaded yet.")
+            return
+        # Base name = common prefix of the loaded data file names (i.e. the
+        # name the data was saved with); folder = where those files live.
+        names = [os.path.splitext(os.path.basename(p))[0] for p in self._da_files]
+        base = os.path.commonprefix(names).rstrip("_- ") if names else ""
+        if not base:
+            base = names[0] if names else "analysis"
+        folder = os.path.dirname(self._da_files[0]) if self._da_files else ""
+        if not folder or not os.path.isdir(folder):
+            folder = filedialog.askdirectory(title="Folder for the PNG files")
+            if not folder:
+                return
+        current_kind = self._da_plot_kind.get()
+        written: list[str] = []
+        try:
+            for kind, suffix in self._DA_SAVE_ALL_SUFFIXES.items():
+                self._da_plot_kind.set(kind)
+                self._da_render()
+                path = os.path.join(folder, f"{base}_{suffix}.png")
+                self._da_fig.savefig(path, dpi=300, facecolor="white",
+                                     bbox_inches="tight")
+                written.append(path)
+        except Exception as e:
+            self._log_write(f"Error in Save all PNG: {e}", RED)
+        finally:
+            # Restore the plot the user was looking at.
+            self._da_plot_kind.set(current_kind)
+            self._da_render()
+        if written:
+            self._log_write(f"Save all PNG: {len(written)} files in {folder}", GREEN)
+            for p in written:
+                self._log_write(f"  → {os.path.basename(p)}", FG_DIM)
     # -----------------------------------------------------------------------
     # Log Panel
     # -----------------------------------------------------------------------
@@ -1068,18 +1039,14 @@ class GratmaApp:
         frm = Frame(self.root, bg=BG2, height=140)
         frm.pack(fill=X)
         frm.pack_propagate(False)
-
         header = Frame(frm, bg=BG2)
         header.pack(fill=X, padx=8, pady=(4, 0))
-
         Label(header, text="Log / Debug Console", bg=BG2, fg=FG_DIM,
               font=("Segoe UI", 9, "bold")).pack(side="left")
-
         self._btn_clear_log = Button(
             header, text="Clear", command=self._on_clear_log,
             bg=BG, fg=FG_DIM, relief="flat", font=("Segoe UI", 8))
         self._btn_clear_log.pack(side="right")
-
         self._log = Text(frm, bg=BG2, fg=FG_DIM,
                          font=("Consolas", 8), relief="flat",
                          state=DISABLED, wrap="word")
@@ -1087,7 +1054,6 @@ class GratmaApp:
         self._log.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill=Y, pady=(0, 4))
         self._log.pack(fill=BOTH, expand=True, padx=8, pady=(0, 4))
-
     # -----------------------------------------------------------------------
     # UI Helpers
     # -----------------------------------------------------------------------
@@ -1098,7 +1064,6 @@ class GratmaApp:
         ttk.Entry(parent, textvariable=var, width=12).grid(
             row=row, column=1, sticky="w", pady=2)
         return var
-
     def _setup_axes(self, ax, title: str, xlabel: str, ylabel: str) -> None:
         ax.set_facecolor(BG2)
         for spine in ax.spines.values():
@@ -1112,7 +1077,6 @@ class GratmaApp:
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
         ax.grid(True, color=BG, linewidth=0.5, alpha=0.6)
-
     @staticmethod
     def _style_toolbar(toolbar) -> None:
         toolbar.config(background=BG2)
@@ -1122,7 +1086,6 @@ class GratmaApp:
                          activebackground=BG, activeforeground=FG)
             except Exception:
                 pass
-
     def _log_write(self, msg: str, color: str = FG_DIM) -> None:
         ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         self._log.config(state=NORMAL)
@@ -1135,12 +1098,10 @@ class GratmaApp:
         self._log.tag_add(tag, start, end)
         self._log.see(END)
         self._log.config(state=DISABLED)
-
     def _on_clear_log(self) -> None:
         self._log.config(state=NORMAL)
         self._log.delete("1.0", END)
         self._log.config(state=DISABLED)
-
     def _update_conn_state(self, connected: bool) -> None:
         if connected:
             self._conn_led.config(fg=GREEN)
@@ -1167,28 +1128,23 @@ class GratmaApp:
             self._info_system_status.set("—")
             self._info_usb_mode.set("—")
         self._set_busy(False)
-
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
         connected = self._dev is not None
         btn_state = NORMAL if (connected and not busy) else DISABLED
-
         # Buttons that require connection
         for btn in [self._btn_ping, self._btn_start_meas, self._btn_instr_refresh,
                     self._btn_set_voltage, self._btn_set_switch, self._btn_get_status,
                     self._btn_set_vs, self._btn_set_vg]:
             btn.config(state=btn_state)
-        
+
         # STOP button: active only when a measurement is in progress
         self._btn_stop_meas.config(state=NORMAL if (connected and busy) else DISABLED)
-
         self._btn_connect.config(state=DISABLED if busy else NORMAL)
-
         if busy:
             self._progress.start(10)
         else:
             self._progress.stop()
-
     # -----------------------------------------------------------------------
     # Automatic PING System (ping-pong)
     # -----------------------------------------------------------------------
@@ -1197,7 +1153,6 @@ class GratmaApp:
         if self._ping_job is None and self._dev is not None:
             self._log_write("Automatic ping started (every 2.5s)", CYAN)
             self._ping_loop()
-
     def _stop_ping_loop(self) -> None:
         """Stops the automatic ping loop"""
         if self._ping_job is not None:
@@ -1206,19 +1161,15 @@ class GratmaApp:
             self._ping_active = False
             self._update_ping_indicator(False)
             self._log_write("Automatic ping stopped", FG_DIM)
-
     def _ping_loop(self) -> None:
         """Ping loop: sends ALWAYS, even during measurements"""
         if self._dev is None:
             self._ping_job = None
             return
-
         # CRITICAL: Ping must run ALWAYS, even during measurements
         # Otherwise, firmware returns to USB_CONSOLE after 5s
         threading.Thread(target=self._ping_background, daemon=True).start()
-
         self._ping_job = self.root.after(PING_INTERVAL_MS, self._ping_loop)
-
     def _ping_background(self) -> None:
         """Sends ping in background without blocking UI"""
         try:
@@ -1227,7 +1178,6 @@ class GratmaApp:
                 self._rq.put(("ping_ok", None))
         except Exception as e:
             self._rq.put(("ping_fail", str(e)))
-
     def _update_ping_indicator(self, active: bool) -> None:
         """Updates the visual ping-pong indicator"""
         if active:
@@ -1238,7 +1188,6 @@ class GratmaApp:
             self._ping_led.config(fg=ORANGE, text="○")
             self._ping_label.config(text="Ping-Pong: Inactive", fg=ORANGE)
             self._info_usb_mode.set("USB_CONSOLE")
-
     # -----------------------------------------------------------------------
     # Background Threading Infrastructure
     # -----------------------------------------------------------------------
@@ -1261,9 +1210,7 @@ class GratmaApp:
             except Exception as e:
                 self._rq.put(("log_error", f"{type(e).__name__}: {e}"))
                 self._rq.put(("busy_off", None))
-
         threading.Thread(target=_wrapper, daemon=True).start()
-
     def _poll(self) -> None:
         """Processes messages from background threads every 100 ms"""
         try:
@@ -1273,7 +1220,6 @@ class GratmaApp:
         except queue.Empty:
             pass
         self.root.after(100, self._poll)
-
     def _dispatch(self, msg: str, data) -> None:
         match msg:
             case "log":
@@ -1327,11 +1273,9 @@ class GratmaApp:
                 self._on_measurement_complete(data)
             case "meas_update":
                 self._on_measurement_update(data)
-
     # -----------------------------------------------------------------------
     # Handlers de eventos
     # -----------------------------------------------------------------------
-
     # -- Device Scanning -----------------------------------------------
     def _scan_devices(self) -> None:
         """Searches for available GRATMA devices and updates the combo."""
@@ -1347,10 +1291,8 @@ class GratmaApp:
         self._log_write(
             f"USB Scan: {n} device{'s' if n != 1 else ''} found.",
             GREEN if n else ORANGE)
-
     def _on_scan(self) -> None:
         self._scan_devices()
-
     # -- Connection -----------------------------------------------------------
     def _on_connect(self) -> None:
         self._set_busy(True)
@@ -1360,37 +1302,30 @@ class GratmaApp:
             idx = self._dev_combo.current()
             selected = self._scan_results[idx] if 0 <= idx < len(self._scan_results) else None
             self._run_async(self._connect_worker, selected)
-
     def _connect_worker(self, selected: dict | None) -> None:
         dev = GratmaUSB()
         usb_device = selected['device'] if selected is not None else None
         dev.open(device=usb_device)
         self._dev = dev
         self._rq.put(("connected", selected))
-
     def _disconnect_worker(self) -> None:
         if self._dev:
             self._dev.close()
             self._dev = None
         self._rq.put(("disconnected", None))
-
     # -- Ping ---------------------------------------------------------------
     def _on_ping(self) -> None:
         self._set_busy(True)
         self._run_async(self._ping_worker)
-
     def _ping_worker(self) -> None:
         self._dev.ping()
         self._rq.put(("log_ok", "Manual Ping OK — device responds"))
         self._rq.put(("busy_off", None))
-
     # --  Measurements -----------------------------------------------------------
     def _on_start_measurement(self) -> None:
         meas_type = self._meas_type.get()
-
         # Reset abort flag
         self._abort_measurement = False
-
         # Reset real-time graph
         self._rt_kind = {
             "iv_parametric": "iv", "idt": "idt", "differential": "differential",
@@ -1398,20 +1333,16 @@ class GratmaApp:
         }[meas_type]
         self._rt_series = {}
         self._render_meas_plot(final=False)
-
         # Capture identification/sensors for CSV saving
         sensors_list = self._selected_sensors()
         parallel = (self._sensor_mode.get() == "parallel")
-
         try:
             if not sensors_list:
                 raise ValueError("Select at least one sensor")
-
             self._cur_sample = self._sample_name.get().strip() or "sample"
             self._cur_extra = self._extra_text.get().strip()
             self._cur_sensors = sensors_list
             self._cur_parallel = parallel
-
             if meas_type == "iv_parametric":
                 vs = int(self._iv_vs.get())
                 vg_start = int(self._iv_vg_start.get())
@@ -1466,16 +1397,17 @@ class GratmaApp:
                 if discard < 0:
                     raise ValueError("Measures to discard must be >= 0")
                 random_mode = self._random_mode.get()
+                gnd_unselected = self._gnd_unselected.get()
                 # Randomised mode never runs in parallel.
                 self._cur_parallel = False
                 self._set_busy(True)
                 self._run_async(self._meas_iv_random_worker,
                                 vs, vg_start, vg_end, vg_step, sensors_list, reverse,
-                                stab_s, settle_s, discard, reps, random_mode)
+                                stab_s, settle_s, discard, reps, random_mode,
+                                gnd_unselected)
         except ValueError as e:
             messagebox.showerror("Parameter Error", str(e))
             self._set_busy(False)
-
     @staticmethod
     def _sensor_mask(sensors_list: list[int]) -> int:
         """Converts a list of 1-based sensors into a bit mask."""
@@ -1483,26 +1415,21 @@ class GratmaApp:
         for s in sensors_list:
             mask |= 1 << (s - 1)
         return mask
-
     def _on_stop_measurement(self) -> None:
         """Aborts current measurement"""
         if not self._busy:
             return
-
         self._abort_measurement = True
         self._log_write("⚠ STOP requested - aborting measurement...", ORANGE)
-
     def _stream_records(self, update_type: str, point_type: int, end_type: int,
                         phase: int | None = None, poll_s: float = 0.3) -> list[dict] | None:
         """
         Drains firmware buffer until end marker, emitting
         'meas_update' for each batch to refresh the real-time graph.
-
         Returns all received records, or None if user aborts
         (in which case sends STOP to firmware).
         """
         all_records: list[dict] = []
-
         def drain_pending() -> bool:
             found_end = False
             while self._dev.get_data_count() > 0:
@@ -1517,7 +1444,6 @@ class GratmaApp:
                 if any(r["type"] == end_type for r in batch):
                     found_end = True
             return found_end
-
         while True:
             if self._abort_measurement:
                 try:
@@ -1534,45 +1460,73 @@ class GratmaApp:
                 drain_pending()
                 return all_records
             time.sleep(poll_s)
-
+    # -- VG-end reachability helpers ------------------------------------------
+    @staticmethod
+    def _vg_end_residual(vg_start: int, vg_end: int, vg_step: int) -> int:
+        """Returns the length (mV) of the shortened final step needed to land
+        exactly on VG end, or 0 when the range is an exact multiple of the
+        step (e.g. start=0, end=1200, step=200 → 0; but from 1100 with
+        step=200 the last step must be only 100 mV)."""
+        if vg_step <= 0:
+            return 0
+        return abs(vg_end - vg_start) % vg_step
+    def _log_vg_end_note(self, vg_start: int, vg_end: int, vg_step: int) -> None:
+        """Logs how the sweep will land on VG end when the step does not
+        divide the range exactly (the firmware clamps the final step)."""
+        residual = self._vg_end_residual(vg_start, vg_end, vg_step)
+        if residual:
+            self._log_write(
+                f"VG range not a multiple of the step: the final step is "
+                f"shortened to {residual} mV so the sweep still measures "
+                f"exactly at VG end = {vg_end} mV.", ORANGE)
+    def _check_vg_end_reached(self, pts: list[dict], vg_end: int,
+                              label: str = "") -> None:
+        """After a sweep, verifies that the maximum VG actually measured
+        reached VG end (within 1 mV) and warns in the log if it did not —
+        which would mean the firmware is missing the final-step clamp."""
+        if not pts:
+            return
+        vg_max_mv = max(p["v1"] for p in pts) * 1000.0
+        if vg_max_mv < vg_end - 1.0:
+            self._log_write(
+                f"⚠ {label}last VG measured = {vg_max_mv:.0f} mV but "
+                f"VG end = {vg_end} mV — update the firmware with the "
+                f"final-step clamp so the sweep reaches VG end.", ORANGE)
     def _meas_iv_param_worker(self, vs, vg_start, vg_end, vg_step, mask, reverse, reps, parallel) -> None:
         mode = "parallel" if parallel else "sequential"
         self._log_write(
             f"I-V ({mode}): VS={vs}mV  VG={vg_start}→{vg_end}mV  step={vg_step}mV  "
             f"sensors=0x{mask:02X}  reps={reps}", CYAN)
+        self._log_vg_end_note(vg_start, vg_end, vg_step)
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._dev.start_sweep_ex(
             vs_mv=vs, vg_start_mv=vg_start, vg_end_mv=vg_end,
             vg_step_mv=vg_step, sensors=mask,
             reverse=reverse, repetitions=reps, parallel=parallel)
-
         records = self._stream_records("iv", RecordType.SWEEP_POINT, RecordType.SWEEP_END)
         if records is None:
             self._rq.put(("log_warn", "I-V measurement aborted by user"))
             self._rq.put(("busy_off", None))
             return
-
         result = None
         try:
             result = self._dev.get_result()
         except Exception:
             pass
         pts = [r for r in records if r["type"] == RecordType.SWEEP_POINT]
+        self._check_vg_end_reached(pts, vg_end)
         meta = {
             "timestamp": timestamp, "vs_mv": vs, "vg_start_mv": vg_start,
             "vg_end_mv": vg_end, "vg_step_mv": vg_step, "reps": reps,
             "reverse": reverse,
         }
         self._rq.put(("meas_done", {"type": "iv", "records": pts, "result": result, "meta": meta}))
-
     def _meas_idt_worker(self, sensors_list, vg, vs, total, period, parallel) -> None:
         mode = "parallel" if parallel else "sequential"
         self._log_write(
             f"IDT ({mode}): sensors={sensors_list}  VG={vg}mV  VS={vs}mV  "
             f"dur={total}s  period={period}s", CYAN)
-
         all_samples: list[dict] = []
-
         if parallel:
             # Single measurement with all sensors connected at once.
             # Firmware expects the sensor index in the same 1-based
@@ -1606,24 +1560,21 @@ class GratmaApp:
                     self._rq.put(("busy_off", None))
                     return
                 all_samples.extend(r for r in records if r["type"] == RecordType.IDT_SAMPLE)
-
         self._rq.put(("meas_done", {"type": "idt", "records": all_samples, "result": None}))
-
     def _meas_differential_worker(self, vs, vg_start, vg_end, vg_step, mask, reverse, reps, parallel) -> None:
         def start_phase():
             self._dev.start_sweep_ex(
                 vs_mv=vs, vg_start_mv=vg_start, vg_end_mv=vg_end,
                 vg_step_mv=vg_step, sensors=mask,
                 reverse=reverse, repetitions=reps, parallel=parallel)
-
         def build_meta(ts: str) -> dict:
             return {
                 "timestamp": ts, "vs_mv": vs, "vg_start_mv": vg_start,
                 "vg_end_mv": vg_end, "vg_step_mv": vg_step, "reps": reps,
                 "reverse": reverse,
             }
-
         self._log_write("═══ Differential Measurement - PHASE 1: Baseline ═══", MAGENTA)
+        self._log_vg_end_note(vg_start, vg_end, vg_step)
         # Phase 1 (streaming real-time, phase=1)
         ts1 = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         start_phase()
@@ -1640,18 +1591,14 @@ class GratmaApp:
             pass
         pts1 = [r for r in records1 if r["type"] == RecordType.SWEEP_POINT]
         self._diff_records_phase1 = pts1
-
         self._log_write(f"Phase 1 completed: VG_min1 = {result1:.4f} V" if result1 is not None
                         else "Phase 1 completed", GREEN)
-
         # Wait for user confirmation to start phase 2. No timeout:
         # adding the sample can take an indefinite amount of time, so wait
         # until user responds Yes (continue) or No (cancel).
         self._rq.put(("log", "⚠ Add the sample to the sensor and confirm in the dialog to continue with Phase 2"))
-
         answer = [False]
         answered = threading.Event()
-
         def ask_in_main():
             answer[0] = messagebox.askyesno(
                 "Differential Measurement",
@@ -1659,15 +1606,12 @@ class GratmaApp:
                 "Add the sample to the sensor and press Yes to continue with Phase 2.\n\n"
                 "Press No to cancel.")
             answered.set()
-
         self.root.after(0, ask_in_main)
         answered.wait()
-
         if not answer[0]:
             self._rq.put(("log_warn", "Differential measurement cancelled by user"))
             self._rq.put(("busy_off", None))
             return
-
         self._log_write("═══ Differential Measurement - PHASE 2: With Sample ═══", MAGENTA)
         # Phase 2 (streaming real-time, phase=2; curves from phase 1
         # remain on the graph)
@@ -1686,7 +1630,6 @@ class GratmaApp:
             pass
         pts2 = [r for r in records2 if r["type"] == RecordType.SWEEP_POINT]
         self._diff_records_phase2 = pts2
-
         # Calculate delta
         meta1 = build_meta(ts1)
         meta2 = build_meta(ts2)
@@ -1711,7 +1654,6 @@ class GratmaApp:
                 "meta1": meta1,
                 "meta2": meta2,
             }))
-
     # -- Randomised I-V ------------------------------------------------------
     def _sleep_abortable(self, seconds: float) -> bool:
         """Sleeps in small slices, returning False as soon as STOP is pressed."""
@@ -1721,7 +1663,6 @@ class GratmaApp:
                 return False
             time.sleep(min(0.2, deadline - time.monotonic()))
         return not self._abort_measurement
-
     def _wait_device_idle(self, timeout: float = 15.0) -> bool:
         """Waits until the device reports IDLE before starting the next sweep.
         Prevents a 'device busy' error when firing single-sensor sweeps
@@ -1740,7 +1681,6 @@ class GratmaApp:
                 raise GratmaError("Device in ERROR status before sweep")
             time.sleep(0.1)
         return True  # proceed anyway after the timeout
-
     def _wait_sweeping(self, timeout: float = 3.0) -> None:
         """After starting a sweep, waits until the device has actually left
         IDLE (status SWEEPING or first data available). Without this a fast
@@ -1759,7 +1699,6 @@ class GratmaApp:
             if st in (DeviceStatus.SWEEPING, DeviceStatus.ERROR):
                 return
             time.sleep(0.05)
-
     @staticmethod
     def _random_sequence_order(sensors_list: list[int]) -> list[int]:
         """Builds a randomised measurement order that alternates between the
@@ -1785,30 +1724,45 @@ class GratmaApp:
                 order.append(bottom[bi]); bi += 1
             take_top = not take_top
         return order
-
     def _meas_iv_random_worker(self, vs, vg_start, vg_end, vg_step, sensors_list,
-                               reverse, stab_s, settle_s, discard, reps, random_mode) -> None:
+                               reverse, stab_s, settle_s, discard, reps, random_mode,
+                               gnd_unselected) -> None:
         total_seq = discard + reps
         self._log_write(
             f"I-V Randomised: VS(Vd)={vs}mV  VG={vg_start}→{vg_end}mV  step={vg_step}mV  "
             f"sensors={sensors_list}  discard={discard}  keep(reps)={reps}  "
-            f"→ {total_seq} sequences  random={'on' if random_mode else 'off'}", CYAN)
+            f"→ {total_seq} sequences  random={'on' if random_mode else 'off'}  "
+            f"GND-unselected={'on' if gnd_unselected else 'off'}", CYAN)
+        self._log_vg_end_note(vg_start, vg_end, vg_step)
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
         # 1. Connect all channels and set everything to 0 V.
         self._log_write("Connecting all channels (SW0/SW1 = 0xFF) and setting 0 V ...", FG_DIM)
         self._dev.set_switch(sw=0, sw_map=0xFF)
         self._dev.set_switch(sw=1, sw_map=0xFF)
         self._dev.set_voltage(dac=0, out=0, mv=0)  # VG = 0 V
         self._dev.set_voltage(dac=1, out=0, mv=0)  # VS / drain = 0 V
-
+        # 1b. Tell the firmware what to do with the NON-selected sources on
+        #     every sensor change (USB_VENDOR_CMD_SET_UNSEL_MODE, 0x14):
+        #     GND (grounded) when the checkbox is ticked, OPEN otherwise.
+        try:
+            self._dev.set_unsel_mode(UnselMode.GND if gnd_unselected
+                                     else UnselMode.OPEN)
+            self._log_write(
+                "Unselected-source mode: "
+                + ("GND — non-measured sources tied to ground"
+                   if gnd_unselected else "OPEN — classic behaviour"), CYAN)
+        except GratmaError as e:
+            if gnd_unselected:
+                self._log_write(
+                    f"⚠ Firmware does not support SET_UNSEL_MODE (0x14): {e} — "
+                    "continuing with the classic (open) behaviour", ORANGE)
+                gnd_unselected = False
         # 2. Stabilization wait.
         self._log_write(f"Stabilizing for {stab_s / 60.0:.2f} min ...", ORANGE)
         if not self._sleep_abortable(stab_s):
             self._rq.put(("log_warn", "Random I-V aborted during stabilization"))
             self._rq.put(("busy_off", None))
             return
-
         # 3. Switch the drain to Vd and let it settle.
         self._log_write(f"Setting drain to {vs} mV and settling {settle_s:.0f} s ...", FG_DIM)
         self._dev.set_voltage(dac=1, out=0, mv=vs)
@@ -1816,7 +1770,6 @@ class GratmaApp:
             self._rq.put(("log_warn", "Random I-V aborted during drain settle"))
             self._rq.put(("busy_off", None))
             return
-
         # 4-6. Run (discard + reps) sequences. The first 'discard' sequences are
         # thrown away; the remaining 'reps' are kept and renumbered rep 1..reps.
         kept: list[dict] = []
@@ -1845,6 +1798,21 @@ class GratmaApp:
                     self._rq.put(("log_warn", "Random I-V aborted by user"))
                     self._rq.put(("busy_off", None))
                     return
+                if gnd_unselected:
+                    # Report which sources the firmware is grounding while
+                    # this sensor is measured, and the drain voltage actually
+                    # applied to the measured one (INA228[0] = VS bus).
+                    grounded = [s for s in range(1, 9) if s != sensor]
+                    self._log_write(
+                        f"  S{sensor} selected → sources to GND: "
+                        + ", ".join(f"S{g}" for g in grounded), CYAN)
+                    try:
+                        vbus = self._dev.get_vbus(0)
+                        self._log_write(
+                            f"  S{sensor} drain voltage (VS bus): {vbus:.4f} V", CYAN)
+                    except Exception as e:
+                        self._log_write(
+                            f"  Could not read the VS bus voltage: {e}", ORANGE)
                 self._log_write(f"  Sweeping S{sensor} ...", FG_DIM)
                 self._dev.start_sweep_ex(
                     vs_mv=vs, vg_start_mv=vg_start, vg_end_mv=vg_end,
@@ -1864,13 +1832,21 @@ class GratmaApp:
                 for r in pts:
                     r["sensor"] = sensor
                     r["rep"] = kept_rep
+                self._check_vg_end_reached(pts, vg_end, label=f"S{sensor}: ")
                 self._log_write(
                     f"    S{sensor}: {len(pts)} points"
                     + ("  (discarded)" if is_discard else ""),
                     FG_DIM if is_discard else GREEN)
                 if not is_discard:
                     kept.extend(pts)
-
+        # Leave the firmware back in the classic (open) mode so the setting
+        # does not silently affect the other measurement types.
+        if gnd_unselected:
+            try:
+                self._dev.set_unsel_mode(UnselMode.OPEN)
+                self._log_write("Unselected-source mode restored to OPEN", FG_DIM)
+            except Exception:
+                pass
         meta = {
             "timestamp": timestamp, "vs_mv": vs, "vg_start_mv": vg_start,
             "vg_end_mv": vg_end, "vg_step_mv": vg_step, "reps": reps,
@@ -1880,12 +1856,10 @@ class GratmaApp:
             "type": "iv_random", "records": kept, "result": None, "meta": meta,
             "n_sensors": len(sensors_list), "n_reps": reps,
         }))
-
     def _on_measurement_complete(self, data) -> None:
         """Callback when a measurement completes"""
         meas_type = data["type"]
         result = data.get("result")
-
         # Rebuild series from complete result and paint
         # final graph in Measurements tab (real-time updates
         # may have been lost if the app fell behind)
@@ -1896,13 +1870,11 @@ class GratmaApp:
         else:
             self._series_ingest(data["records"])
         self._render_meas_plot(final=True)
-
         if meas_type == "iv":
             self._sweep_records = data["records"]
             if result is not None:
                 self._meas_result_lbl.config(text=f"VG_min = {result:.4f} V")
             self._log_write(f"I-V completed — {len(data['records'])} points", GREEN)
-
         elif meas_type == "iv_random":
             self._sweep_records = data["records"]
             n_sensors = data.get("n_sensors", "?")
@@ -1911,11 +1883,9 @@ class GratmaApp:
             self._log_write(
                 f"Random I-V completed — {len(data['records'])} points "
                 f"({n_reps} reps kept per sensor)", GREEN)
-
         elif meas_type == "idt":
             self._idt_records = data["records"]
             self._log_write(f"IDT completed — {len(data['records'])} samples", GREEN)
-
         elif meas_type == "differential":
             self._diff_records_phase1 = data["phase1"]
             self._diff_records_phase2 = data["phase2"]
@@ -1923,22 +1893,18 @@ class GratmaApp:
                 self._meas_result_lbl.config(text=f"ΔVG = {result:.4f} V")
             self._log_write(f"Differential completed — ΔVG = {result:.4f} V" if result is not None
                             else "Differential completed", GREEN)
-
         self._last_meas_data = data
         self._btn_export_meas.config(state=NORMAL)
         self._set_busy(False)
-
         # Auto-save in the output folder (if one is configured)
         if self._out_folder.get().strip():
             self._export_measurement_files(data, auto=True)
         else:
             self._log_write("No output folder: use 'Export CSV' to save", ORANGE)
-
     def _on_measurement_update(self, data) -> None:
         """Accumulates received points and refreshes the real-time graph"""
         self._series_ingest(data["records"], phase=data.get("phase", 0))
         self._render_meas_plot(final=False)
-
     # -----------------------------------------------------------------------
     # Measurement tab graph (real-time and final result)
     # -----------------------------------------------------------------------
@@ -1955,19 +1921,16 @@ class GratmaApp:
                 x = r["v1"]
                 backward = bool(r.get("backward", False))
             self._rt_series.setdefault(key, []).append((x, r["v2"], backward))
-
     _RT_TITLES = {
         "iv": "I-V Curve",
         "manual": "Manual Measurement",
         "differential": "Differential Measurement (Baseline vs Sample)",
         "idt": "I vs Time (IDT)",
     }
-
     # Current unit prefixes (exponent of 10 -> unit label), used to pick a
     # readable order of magnitude for the Y axis of the measurement graph.
     _CURRENT_UNITS = [(0, "A"), (-3, "mA"), (-6, "µA"), (-9, "nA"),
                        (-12, "pA"), (-15, "fA")]
-
     @classmethod
     def _select_current_unit(cls, values) -> tuple[str, float]:
         """Picks the most readable current unit (A, mA, µA, nA, pA, fA) from
@@ -1983,7 +1946,6 @@ class GratmaApp:
         scale = 10 ** exp3
         unit = dict(cls._CURRENT_UNITS)[exp3]
         return unit, scale
-
     def _render_meas_plot(self, final: bool = False) -> None:
         """Repaints the Measurements graph from accumulated series."""
         ax = self._meas_ax
@@ -1992,16 +1954,13 @@ class GratmaApp:
         if not final:
             title += " — Real-time"
         xlabel = "Time (s)" if self._rt_kind == "idt" else "$V_G$ (V)"
-
         # Pick the Y axis unit/scale from the current data so the plotted
         # numbers stay in a readable range (e.g. µA instead of 0.0000012 A).
         all_ys = [y for pts in self._rt_series.values() for _x, y, _b in pts]
         unit, scale = self._select_current_unit(all_ys)
         ylabel = f"$I_{{DS}}$ ({unit})"
         self._setup_axes(ax, title, xlabel, ylabel)
-
         plotted_labels: set[str] = set()
-
         # Order: by sensor, then phase
         for key in sorted(self._rt_series, key=lambda k: (k[1], k[0])):
             phase, sensor = key
@@ -2031,14 +1990,11 @@ class GratmaApp:
                             label=label if show_label else None)
                     run_start = i
                 i += 1
-
         if plotted_labels:
             ax.legend(facecolor=BG2, edgecolor=FG_DIM, labelcolor=FG,
                       fontsize=7, ncol=2 if len(plotted_labels) > 8 else 1)
-
         self._meas_fig.tight_layout()
         self._meas_canvas.draw()
-
     @staticmethod
     def _tint(hex_color: str, t: float) -> str:
         """Lightens a color by mixing it with white (t=0 → base color, t=1 → white)."""
@@ -2047,7 +2003,6 @@ class GratmaApp:
         g = round(g + (255 - g) * t)
         b = round(b + (255 - b) * t)
         return f"#{r:02x}{g:02x}{b:02x}"
-
     def _curve_color(self, sensor: int, phase: int, backward: bool) -> str:
         """Curve color: base tone by sensor, lightened based on phase/direction.
         Simple measurement: forward = base tone (dark), backward = lighter.
@@ -2059,7 +2014,6 @@ class GratmaApp:
         else:
             t = 0.4 if backward else 0.0
         return self._tint(base, t)
-
     def _curve_label(self, sensor: int, phase: int, backward: bool) -> str:
         if self._rt_kind == "idt":
             return f"Sensor {sensor}"
@@ -2067,7 +2021,6 @@ class GratmaApp:
         if phase:
             return f"S{sensor} {'baseline' if phase == 1 else 'sample'} {direction}"
         return f"S{sensor} {direction}"
-
     def _on_export_measurement(self) -> None:
         if self._last_meas_data is None:
             return
@@ -2077,13 +2030,11 @@ class GratmaApp:
                 return
             self._out_folder.set(folder)
         self._export_measurement_files(self._last_meas_data, auto=False)
-
     @staticmethod
     def _sanitize_token(tok: str) -> str:
         """Cleans a token for use in a file name."""
         tok = (tok or "").strip().replace(" ", "-")
         return "".join(c for c in tok if c.isalnum() or c in "-+.")
-
     def _csv_path(self, sensor_tok: str, type_tok: str, rep: int) -> str:
         """Builds the path <sample>_<sensor>_<type>_<rep>_<extra>.csv in the output folder."""
         parts = [self._sanitize_token(self._cur_sample) or "sample",
@@ -2092,7 +2043,6 @@ class GratmaApp:
         if extra:
             parts.append(extra)
         return os.path.join(self._out_folder.get().strip(), "_".join(parts) + ".csv")
-
     @staticmethod
     def _write_iv_csv(path: str, recs: list[dict], meta: dict | None = None) -> None:
         """Writes an I-V CSV: a metadata block with the measurement
@@ -2114,7 +2064,6 @@ class GratmaApp:
             w.writerow(["VG_V", "IS_A", "VS_V", "IG_A"])
             for r in recs:
                 w.writerow([r["v1"], r["v2"], r.get("v3", 0.0), r.get("v4", 0.0)])
-
     @staticmethod
     def _write_idt_csv(path: str, recs: list[dict]) -> None:
         recs = sorted(recs, key=lambda r: r["seq"])
@@ -2124,7 +2073,6 @@ class GratmaApp:
             for r in recs:
                 w.writerow([r["seq"], r["seq"] / 1000.0, r["v1"], r["v2"],
                             r.get("v3", 0.0), r.get("v4", 0.0)])
-
     def _export_iv_phase(self, records: list[dict], type_tok: str, meta: dict | None = None) -> list[str]:
         """Writes one CSV per (sensor, repetition) — or per repetition if parallel.
         Returns the paths written."""
@@ -2147,7 +2095,6 @@ class GratmaApp:
                 self._write_iv_csv(path, recs, meta)
                 written.append(path)
         return written
-
     def _export_measurement_files(self, data: dict, auto: bool) -> None:
         """Saves the measurement CSVs to the output folder with agreed naming."""
         try:
@@ -2175,7 +2122,6 @@ class GratmaApp:
                         path = self._csv_path(f"S{sensor}", "idt", 1)
                         self._write_idt_csv(path, recs)
                         written.append(path)
-
             if written:
                 # Remember the written files so the Data Analysis tab can
                 # represent "the last measurements" without re-picking them.
@@ -2189,7 +2135,6 @@ class GratmaApp:
                 self._log_write("No data to export", ORANGE)
         except Exception as e:
             self._log_write(f"Error saving CSV: {e}", RED)
-
     # -- GRATMA Control -------------------------------------------------------
     def _on_set_vs(self) -> None:
         try:
@@ -2199,14 +2144,12 @@ class GratmaApp:
             return
         self._set_busy(True)
         self._run_async(self._set_vs_worker, vs_mv)
-
     def _set_vs_worker(self, vs_mv) -> None:
         # Firmware performs automatic calibration with these commands
         # Approximation: DAC VS channel 0
         self._dev.set_voltage(dac=1, out=0, mv=vs_mv)
         self._rq.put(("log_ok", f"Set VS = {vs_mv} mV (high-level)"))
         self._rq.put(("busy_off", None))
-
     def _on_set_vg(self) -> None:
         try:
             vg_mv = int(self._hl_vg.get())
@@ -2215,13 +2158,11 @@ class GratmaApp:
             return
         self._set_busy(True)
         self._run_async(self._set_vg_worker, vg_mv)
-
     def _set_vg_worker(self, vg_mv) -> None:
         # Approximation: DAC VG channel 0
         self._dev.set_voltage(dac=0, out=0, mv=vg_mv)
         self._rq.put(("log_ok", f"Set VG = {vg_mv} mV (high-level)"))
         self._rq.put(("busy_off", None))
-
     def _on_set_voltage(self) -> None:
         try:
             dac = int(self._dac_idx.get()[0])
@@ -2232,12 +2173,10 @@ class GratmaApp:
             return
         self._set_busy(True)
         self._run_async(self._set_voltage_worker, dac, out, mv)
-
     def _set_voltage_worker(self, dac, out, mv) -> None:
         self._dev.set_voltage(dac=dac, out=out, mv=mv)
         self._rq.put(("log_ok", f"Set Voltage RAW — DAC={dac} out={out} → {mv} mV"))
         self._rq.put(("busy_off", None))
-
     def _on_set_switch(self) -> None:
         try:
             sw = int(self._sw_idx.get())
@@ -2248,25 +2187,20 @@ class GratmaApp:
             return
         self._set_busy(True)
         self._run_async(self._set_switch_worker, sw, sw_map)
-
     def _set_switch_worker(self, sw, sw_map) -> None:
         self._dev.set_switch(sw=sw, sw_map=sw_map)
         self._rq.put(("log_ok", f"Set Switch — SW={sw} map=0x{sw_map:02X}"))
         self._rq.put(("busy_off", None))
-
     def _on_get_status(self) -> None:
         self._set_busy(True)
         self._run_async(self._get_status_worker)
-
     def _get_status_worker(self) -> None:
         st = self._dev.get_status()
         self._rq.put(("dev_status", st))
-
     # -- Instruments ---------------------------------------------------------
     def _on_read_instruments(self) -> None:
         self._set_busy(True)
         self._run_async(self._instruments_worker)
-
     def _instruments_worker(self) -> None:
         if self._dev is None:
             return
@@ -2278,14 +2212,12 @@ class GratmaApp:
             "ina0_temp": self._dev.get_temp(0),
         }
         self._rq.put(("instruments", d))
-
     def _update_instruments(self, d: dict) -> None:
         vbus0 = d["ina0_vbus"]
         vbus1 = d["ina1_vbus"]
         vsh0 = d["ina0_vshunt"]
         vsh1 = d["ina1_vshunt"]
         temp0 = d["ina0_temp"]
-
         self._instr_vars["ina0_vbus"].set(f"{vbus0:.4f}")
         self._instr_vars["ina1_vbus"].set(f"{vbus1:.4f}")
         self._instr_vars["ina0_vshunt"].set(f"{vsh0 * 1e6:.2f}")
@@ -2295,7 +2227,6 @@ class GratmaApp:
         self._instr_vars["ina0_temp"].set(f"{temp0:.1f}")
         self._instr_ts_lbl.config(
             text=f"Last reading: {datetime.now().strftime('%H:%M:%S.%f')[:-3]}")
-
     def _on_continuous_toggle(self) -> None:
         if self._instr_continuous.get():
             self._schedule_continuous()
@@ -2303,7 +2234,6 @@ class GratmaApp:
             if self._continuous_job:
                 self.root.after_cancel(self._continuous_job)
                 self._continuous_job = None
-
     def _schedule_continuous(self) -> None:
         if not self._instr_continuous.get() or self._dev is None:
             return
@@ -2315,8 +2245,6 @@ class GratmaApp:
         except ValueError:
             interval_ms = 1000
         self._continuous_job = self.root.after(interval_ms, self._schedule_continuous)
-
-
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -2324,7 +2252,5 @@ def main():
     root = Tk()
     app = GratmaApp(root)
     root.mainloop()
-
-
 if __name__ == "__main__":
     main()
