@@ -105,6 +105,7 @@ class Cmd:
     SET_GAIN         = 0x12
     SET_SWITCH       = 0x13
     SET_UNSEL_MODE   = 0x14   # USB_VENDOR_CMD_SET_UNSEL_MODE — Payload: [u8 mode] 0=open, 1=GND
+    SET_MEAS_CFG     = 0x15   # USB_VENDOR_CMD_SET_MEAS_CFG — Payload: [u8 avg][u8 ct][u16 settle_ms]
     GET_VBUS         = 0x20
     GET_VSHUNT       = 0x21
     GET_TEMP         = 0x22
@@ -135,6 +136,32 @@ class DeviceStatus:
 class UnselMode:
     OPEN = 0x00   # comportamiento clásico: sources no seleccionados al aire
     GND  = 0x01   # sources no seleccionados conectados a tierra
+
+# ---------------------------------------------------------------------------
+# Configuración de adquisición (USB_VENDOR_CMD_SET_MEAS_CFG, 0x15)
+# Códigos del INA228 (datasheet TI, registro ADC_CONFIG)
+# ---------------------------------------------------------------------------
+class InaAvg:
+    """Código AVG del INA228 -> nº de muestras promediadas en hardware."""
+    X1    = 0
+    X4    = 1
+    X16   = 2
+    X64   = 3
+    X128  = 4
+    X256  = 5
+    X512  = 6
+    X1024 = 7
+
+class InaConvTime:
+    """Código de tiempo de conversión del INA228 (por muestra)."""
+    T50US   = 0
+    T84US   = 1
+    T150US  = 2
+    T280US  = 3
+    T540US  = 4
+    T1052US = 5
+    T2074US = 6
+    T4120US = 7
 
 # ---------------------------------------------------------------------------
 # Tipos de registro de datos de medición
@@ -528,6 +555,29 @@ class GratmaUSB:
         if mode not in (UnselMode.OPEN, UnselMode.GND):
             raise GratmaError(f"Modo UNSEL inválido: {mode} (0=open, 1=GND)")
         self._cmd(Cmd.SET_UNSEL_MODE, bytes([mode & 0xFF]))
+
+    def set_meas_config(self, avg_code: int, ct_code: int, settle_ms: int = 0) -> None:
+        """
+        Configura la adquisición del firmware (USB_VENDOR_CMD_SET_MEAS_CFG, 0x15).
+
+        Reduce el ruido EN ORIGEN: integración/promediado hardware del INA228
+        por punto y espera de asentamiento tras cada paso de VG.
+
+        Args:
+            avg_code:  InaAvg.* — promediado hardware del INA228 (1..1024 muestras)
+            ct_code:   InaConvTime.* — tiempo de conversión VBUS/VSHUNT por muestra
+            settle_ms: espera en ms tras cada paso de VG antes de convertir (0..65535)
+
+        La configuración queda memorizada en el firmware y se aplica a todas
+        las medidas posteriores hasta que se vuelva a cambiar.
+        """
+        if not 0 <= avg_code <= 7:
+            raise GratmaError(f"avg_code inválido: {avg_code} (0..7, ver InaAvg)")
+        if not 0 <= ct_code <= 7:
+            raise GratmaError(f"ct_code inválido: {ct_code} (0..7, ver InaConvTime)")
+        settle = max(0, min(65535, int(settle_ms)))
+        payload = struct.pack("<BBH", avg_code, ct_code, settle)
+        self._cmd(Cmd.SET_MEAS_CFG, payload)
 
     # -- Lecturas de instrumentos (asíncronas en firmware) ------------------
 
