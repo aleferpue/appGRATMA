@@ -1,32 +1,32 @@
 """
-app_v4.py — GRATMA v3.6.0 Desktop Application (tkinter + matplotlib)
+app_v4.py — GRATMA v3.7.0 Desktop Application (tkinter + matplotlib)
 
-Improvements v3.6.0 (noise reduction AT THE SOURCE — no post-smoothing):
-    - New "Acquisition (INA228)" panel: hardware averaging (AVG), conversion
-      time and per-VG-step settle, sent to the firmware before every
-      measurement via the new vendor cmd 0x15 (SET_MEAS_CFG). This integrates
-      longer per point instead of smoothing afterwards. Falls back silently
-      (with one warning) on firmware without 0x15.
-    - Ratiometric VS correction (optional): Is·(VS_set/VS_measured) — a
-      physical correction using the drain voltage actually measured at each
-      point, which removes the part of the noise caused by VS dither. Applied
-      to the real-time plot and exported as an EXTRA CSV column (IS_RATIO_A);
-      raw data is never altered.
-    - CSV now also exports VG_SET_V (the setpoint VG grid, reconstructed from
-      the arrival order) as an extra column — plotting vs the setpoint removes
-      the x-axis jitter of the measured VG.
-    - After each I-V measurement the log reports per-sensor quality metrics:
-      point noise (2nd differences), VS dither and the ΔIs–ΔVs correlation,
-      with a verdict on whether the noise is bias-limited.
-    - Data Analysis: new option to use the corrected columns (VG_SET_V /
-      IS_RATIO_A) when present in the files.
+Improvements v3.7.0:
+    - Data Analysis repetition detection now understands the '-N' filename
+      suffix (…-1, …-2, …-3) used by the old GRATMA files, so the R1..Rn
+      checkboxes appear and can be ticked for those measurements too.
+    - Forward/Backward curves are now coloured by sensor (one fixed colour
+      per sensor 1-8) with a "Sensor" legend mapping each colour to its
+      sensor; all repetitions of a sensor share its colour.
+    - The Data Analysis left panel is now scrollable (vertical scrollbar +
+      mouse wheel) so every control, including "Save all PNG", stays
+      reachable on small screens.
+    - "Save all PNG" now names the four plots <wafer/chip>_forward.png,
+      _backward.png, _mean.png and _dirac.png, using the text typed in the
+      "Wafer / Chip" box (falling back to the file names when it is empty).
 
-Improvements v3.5.1:
-    - When VG end is not reached AND a USB timeout occurred during that
-      sweep, the log now correctly reports the missing point(s) as
-      lost-in-transit (measured by the device, dropped by the timed-out
-      USB transfer, recoverable from the CONSOLE| lines of the recovery
-      .txt) instead of wrongly blaming the firmware final-step clamp.
+Improvements v3.6.0:
+    - Data Analysis now also reads the OLD GRATMA .txt exports (header
+      'Vfg;Id;Ig;Is', semicolon-separated) in addition to the new-GRATMA
+      CSVs. The gate voltage is taken from the Vfg column and the current
+      from the Is column (the analogue of the CSV's IS_A); the analysis,
+      configuration and plots are exactly the same for both formats.
+    - Every Data Analysis plot now shows a header at the very top reading
+      'GRATMA nuevo' when the data comes from a CSV or 'GRATMA antiguo' when
+      it comes from a TXT (or both when a mixed selection is loaded).
+    - New single "Wafer / Chip" box in the Data Analysis tab (right below the
+      file buttons); whatever is typed there is shown in that same top header,
+      next to the data-source label.
 
 Improvements v3.5.0:
     - Device-console backup (the RIGHT terminal): on connect, the app also
@@ -116,6 +116,7 @@ Run:
 """
 import csv
 import math
+import re
 import os
 import queue
 import random
@@ -154,8 +155,6 @@ from gratma_usb import (
     GratmaDeviceError,
     GratmaError,
     GratmaUSB,
-    InaAvg,
-    InaConvTime,
     RecordType,
     UnselMode,
 )
@@ -411,7 +410,7 @@ class GratmaApp:
         self.root = root
         self._recorder = recorder
         self._console = SerialConsoleLogger(recorder)
-        self.root.title("GRATMA v3.6.0 — Control & Measurement")
+        self.root.title("GRATMA v3.7.0 — Control & Measurement")
         self.root.configure(bg=BG)
         self.root.minsize(1100, 750)
         self._dev: GratmaUSB | None = None
@@ -426,6 +425,7 @@ class GratmaApp:
         self._last_export_files: list[str] = []  # CSVs written by the last export (for Data Analysis)
         self._da_curves: list[tuple] = []  # loaded (v_fwd, i_fwd, v_bwd, i_bwd) tuples
         self._da_curve_sensors: list[int] = []  # 1-based sensor of each loaded curve
+        self._da_curve_sources: list[str] = []  # "csv" (new GRATMA) / "txt" (old) per curve
         self._da_files: list[str] = []
         self._continuous_job: str | None = None
         self._ping_job: str | None = None
@@ -445,16 +445,9 @@ class GratmaApp:
         # 'meas_progress' message; otherwise it is derived from the records.
         self._rt_progress = ""
         self._rt_progress_worker = False
-        # True if a USB error/retry happened while streaming the current
-        # sweep — used to tell a point lost in a timed-out transfer apart
-        # from a firmware early stop when VG end is not reached.
-        self._stream_usb_glitch = False
         self._da_curve_reps: list[int] = []   # 1-based repetition of each curve
         self._da_rep_vars: dict[int, BooleanVar] = {}
         self._da_mean_var = BooleanVar(value=False)
-        # Acquisition / noise-reduction state
-        self._meas_cfg_warned = False   # warn only once if firmware lacks 0x15
-        self._cur_vs_v: 'float | None' = None  # nominal VS (V) of running measurement
         self._apply_style()
         self._build_ui()
         self._update_conn_state(connected=False)
@@ -649,8 +642,6 @@ class GratmaApp:
         self._build_identification(left)
         # Sensor selection and mode (common to all types)
         self._build_sensor_selection(left)
-        # INA228 acquisition settings (noise reduction at the source)
-        self._build_acquisition_panel(left)
         # Parameter frames (shown/hidden according to type)
         self._meas_params_frame = Frame(left, bg=BG)
         self._meas_params_frame.pack(fill=BOTH, expand=True, pady=(0, 6))
@@ -797,71 +788,6 @@ class GratmaApp:
     def _selected_sensors(self) -> list[int]:
         """List of selected sensors (1-based)."""
         return [i + 1 for i, v in enumerate(self._sensor_vars) if v.get()]
-    # UI label -> INA228 register code (vendor cmd 0x15)
-    _AVG_OPTIONS = [("1", InaAvg.X1), ("4", InaAvg.X4), ("16", InaAvg.X16),
-                    ("64", InaAvg.X64), ("128", InaAvg.X128), ("256", InaAvg.X256)]
-    _CT_OPTIONS = [("150 µs", InaConvTime.T150US), ("280 µs", InaConvTime.T280US),
-                   ("540 µs", InaConvTime.T540US), ("1.05 ms", InaConvTime.T1052US),
-                   ("2.07 ms", InaConvTime.T2074US), ("4.12 ms", InaConvTime.T4120US)]
-    def _build_acquisition_panel(self, parent) -> None:
-        """INA228 acquisition settings, sent to the firmware before every
-        measurement (vendor cmd 0x15): hardware averaging and conversion time
-        (longer integration per point) plus a settle wait after each VG step.
-        This reduces noise AT THE SOURCE — it is not post-smoothing."""
-        frame = ttk.LabelFrame(parent, text="Acquisition (INA228)", padding=10)
-        frame.pack(fill=X, pady=(0, 6))
-        Label(frame, text="Averaging:", bg=BG, fg=FG_DIM,
-              font=("Segoe UI", 9)).grid(row=0, column=0, sticky="w", padx=(0, 6), pady=2)
-        self._acq_avg = StringVar(value="16")
-        ttk.Combobox(frame, textvariable=self._acq_avg, width=5, state="readonly",
-                     values=[lbl for lbl, _c in self._AVG_OPTIONS]).grid(
-            row=0, column=1, sticky="w", pady=2)
-        Label(frame, text="Conv. time:", bg=BG, fg=FG_DIM,
-              font=("Segoe UI", 9)).grid(row=0, column=2, sticky="w", padx=(10, 6), pady=2)
-        self._acq_ct = StringVar(value="1.05 ms")
-        ttk.Combobox(frame, textvariable=self._acq_ct, width=7, state="readonly",
-                     values=[lbl for lbl, _c in self._CT_OPTIONS]).grid(
-            row=0, column=3, sticky="w", pady=2)
-        Label(frame, text="Step settle (ms):", bg=BG, fg=FG_DIM,
-              font=("Segoe UI", 9)).grid(row=1, column=0, sticky="w", padx=(0, 6), pady=2)
-        self._acq_settle = StringVar(value="2")
-        ttk.Entry(frame, textvariable=self._acq_settle, width=6).grid(
-            row=1, column=1, sticky="w", pady=2)
-        self._ratio_correction = BooleanVar(value=False)
-        ttk.Checkbutton(frame, text="Ratiometric VS correction (Is·VSset/VSmeas)",
-                        variable=self._ratio_correction).grid(
-            row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
-        Label(frame,
-              text="Averaging × conv. time = hardware integration per point\n"
-                   "(firmware cmd 0x15; ignored by older firmware, with a warning).\n"
-                   "Ratiometric: divides Is by the MEASURED drain voltage — a\n"
-                   "physical correction shown in the plot and exported as an\n"
-                   "extra CSV column (raw data is kept untouched).",
-              bg=BG, fg=FG_DIM, font=("Segoe UI", 7, "italic"), justify="left").grid(
-            row=3, column=0, columnspan=4, sticky="w", pady=(4, 0))
-    def _apply_meas_config(self) -> None:
-        """Sends the acquisition settings (cmd 0x15) at the start of every
-        measurement. Downgrades gracefully on firmware without support."""
-        try:
-            avg_lbl = self._acq_avg.get()
-            ct_lbl = self._acq_ct.get()
-            avg_code = dict(self._AVG_OPTIONS)[avg_lbl]
-            ct_code = dict(self._CT_OPTIONS)[ct_lbl]
-            settle = max(0, int(float(self._acq_settle.get())))
-        except (KeyError, ValueError):
-            self._log_write("⚠ Invalid acquisition settings — firmware defaults in use", ORANGE)
-            return
-        try:
-            self._dev.set_meas_config(avg_code, ct_code, settle)
-            self._log_write(
-                f"Acquisition: AVG={avg_lbl}  CT={ct_lbl}  settle={settle} ms "
-                "(INA228 hardware integration, cmd 0x15)", CYAN)
-        except GratmaError as e:
-            if not self._meas_cfg_warned:
-                self._meas_cfg_warned = True
-                self._log_write(
-                    f"⚠ Firmware without SET_MEAS_CFG (0x15): {e} — acquisition "
-                    "settings ignored (update the firmware to use them)", ORANGE)
     def _build_meas_params(self) -> None:
         """Builds parameter frames for each measurement type"""
         # Parametric I-V frame (also used by differential)
@@ -1092,10 +1018,11 @@ class GratmaApp:
     def _build_tab_data_analysis(self) -> None:
         tab = Frame(self._nb, bg=BG)
         self._nb.add(tab, text="  Data Analysis  ")
-        # Left panel: controls
-        left = Frame(tab, bg=BG, width=300)
-        left.pack(side="left", fill=Y, padx=(PAD, 0), pady=PAD)
-        left.pack_propagate(False)
+        # Left panel: controls. Wrapped in a scrollable panel (vertical
+        # scrollbar + mouse wheel) so that every control — including the
+        # "Save all PNG" button at the bottom — stays reachable on small
+        # screens where they would otherwise be clipped.
+        left = self._make_scrollable_panel(tab, width=300)
         src_frame = ttk.LabelFrame(left, text="Data Source", padding=12)
         src_frame.pack(fill=X, pady=(0, 8))
         self._btn_da_last = Button(
@@ -1112,13 +1039,14 @@ class GratmaApp:
             activebackground=BG, activeforeground=FG,
             font=("Segoe UI", 9))
         self._btn_da_select.pack(fill=X)
-        # Prefer the corrected columns (VG_SET_V / IS_RATIO_A) when the files
-        # have them (exported by v3.6.0+ with the ratiometric option).
-        self._da_use_corrected = BooleanVar(value=False)
-        ttk.Checkbutton(src_frame, text="Use corrected columns (VG_SET / IS_RATIO)",
-                        variable=self._da_use_corrected,
-                        command=self._on_da_toggle_corrected).pack(
-            anchor="w", pady=(6, 0))
+        # Wafer / chip box (right below the file buttons): its text is shown
+        # at the very top of every plot, next to the data-source label.
+        Label(src_frame, text="Wafer / Chip:", bg=BG, fg=FG_DIM,
+              font=("Segoe UI", 9)).pack(anchor="w", pady=(8, 2))
+        self._da_wafer_chip = StringVar(value="")
+        ttk.Entry(src_frame, textvariable=self._da_wafer_chip).pack(fill=X)
+        # Redraw the plot (updating its header) whenever the text changes.
+        self._da_wafer_chip.trace_add("write", lambda *_: self._da_render())
         # Sensors to represent: all selected by default; unticking a sensor
         # excludes its curves from every plot of this tab.
         sens_frame = ttk.LabelFrame(left, text="Sensors to represent", padding=8)
@@ -1192,19 +1120,15 @@ class GratmaApp:
             filetypes=[("Measurement data", "*.csv *.txt"), ("All files", "*.*")])
         if paths:
             self._da_load_files(list(paths))
-    def _on_da_toggle_corrected(self) -> None:
-        """Re-reads the loaded files with/without the corrected columns."""
-        if self._da_files:
-            self._da_load_files(list(self._da_files))
     def _da_load_files(self, paths: list[str]) -> None:
         curves: list[tuple] = []
         sensors: list[int] = []
         reps: list[int] = []
+        sources: list[str] = []
         skipped = 0
-        use_corr = self._da_use_corrected.get()
         for p in paths:
             try:
-                v, i_a = self._da_read_curve(p, use_corrected=use_corr)
+                v, i_a = self._da_read_curve(p)
             except Exception as e:
                 skipped += 1
                 self._log_write(f"DA: error reading {os.path.basename(p)}: {e}", RED)
@@ -1220,9 +1144,13 @@ class GratmaApp:
             curves.append((v[:mid], i_ua[:mid], v[mid:], i_ua[mid:]))
             sensors.append(self._da_sensor_from_filename(p, fallback=len(curves)))
             reps.append(self._da_rep_from_filename(p))
+            # Data provenance for the plot header: a '.txt' file is the old
+            # GRATMA, anything else (its own '.csv' export) is the new one.
+            sources.append("txt" if p.lower().endswith(".txt") else "csv")
         self._da_curves = curves
         self._da_curve_sensors = sensors
         self._da_curve_reps = reps
+        self._da_curve_sources = sources
         self._da_files = paths
         self._da_rebuild_rep_checks()
         msg = f"{len(curves)} curve(s) loaded"
@@ -1232,58 +1160,37 @@ class GratmaApp:
         self._log_write(f"Data Analysis: {msg}", GREEN if curves else ORANGE)
         self._da_render()
     @staticmethod
-    def _da_read_curve(path: str, use_corrected: bool = False):
+    def _da_read_curve(path: str):
         """Reads a curve as (Vg, Id) numpy arrays (Id in Amperes).
-        Handles the app's own CSV export (metadata block followed by a
-        'VG_V,IS_A,...' header and comma-separated rows) as well as generic
-        two-column text files. With use_corrected=True, prefers the extra
-        columns VG_SET_V (setpoint grid, no x-jitter) and IS_RATIO_A
-        (VS-ratiometric current) when the file has them."""
+
+        Supported formats:
+          - The app's own CSV export (new GRATMA): a metadata block followed
+            by a 'VG_V,IS_A,...' header and comma-separated rows.
+            X = VG_V, Y = IS_A.
+          - The old GRATMA .txt export: a named header such as 'Vfg;Id;Ig;Is'
+            (semicolon-separated). X = Vfg (gate voltage), Y = Is (source
+            current, the analogue of the new format's IS_A; the Id/Ig columns
+            are unused/zero in those files). The voltage and current columns
+            are located by name, so a different column order still works.
+          - Generic two-column text files (whitespace- or comma-separated,
+            with either '.' or ',' as the decimal separator).
+        """
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             lines = f.readlines()
-        # Locate the app-CSV data header, if present.
+        vg: list[float] = []
+        ids: list[float] = []
+        # 1) App CSV export (new GRATMA): locate the 'VG_V,...' data header.
         hdr_idx = None
         for idx, line in enumerate(lines):
             if line.strip().lower().replace(" ", "").startswith("vg_v,"):
                 hdr_idx = idx
                 break
-        vg: list[float] = []
-        ids: list[float] = []
         if hdr_idx is not None:
-            # Resolve column indices by NAME (extra columns are appended at
-            # the end, so older files keep working).
-            names = [t.strip().upper() for t in lines[hdr_idx].split(",")]
-            xcol = names.index("VG_V") if "VG_V" in names else 0
-            ycol = names.index("IS_A") if "IS_A" in names else 1
-            if use_corrected:
-                if "VG_SET_V" in names:
-                    xcol = names.index("VG_SET_V")
-                if "IS_RATIO_A" in names:
-                    ycol = names.index("IS_RATIO_A")
             for line in lines[hdr_idx + 1:]:
                 line = line.strip()
                 if not line:
                     continue
                 parts = line.split(",")
-                if len(parts) <= max(xcol, ycol):
-                    continue
-                try:
-                    x, y = float(parts[xcol]), float(parts[ycol])
-                except ValueError:
-                    continue
-                vg.append(x)
-                ids.append(y)
-        else:
-            for line in lines:
-                s = line.strip()
-                if not s or s.startswith("#"):
-                    continue
-                # Prefer whitespace-separated columns (like the lab's instrument
-                # files, which may use a comma as the decimal separator); fall
-                # back to a comma-separated table with dot decimals.
-                parts = s.replace(",", ".").split()
-                if len(parts) < 2:
-                    parts = s.split(",")
                 if len(parts) < 2:
                     continue
                 try:
@@ -1292,6 +1199,70 @@ class GratmaApp:
                     continue
                 vg.append(x)
                 ids.append(y)
+            return np.asarray(vg, dtype=float), np.asarray(ids, dtype=float)
+        # 2) Old GRATMA .txt export: a named header like 'Vfg;Id;Ig;Is'.
+        #    The delimiter (';', ',' or whitespace) is taken from the header
+        #    line and reused for the data rows; the voltage column (Vfg/Vg)
+        #    and the source-current column (Is) are resolved by name.
+        for idx, line in enumerate(lines):
+            raw = line.strip()
+            if not raw:
+                continue
+            sep = ";" if ";" in raw else ("," if "," in raw else None)
+            toks = [t.strip().lower()
+                    for t in (raw.split(sep) if sep else raw.split())]
+            if len(toks) < 2:
+                continue
+            has_v = any(t.startswith("vf") or t.startswith("vg") for t in toks)
+            has_i = any(t in ("is", "id", "ids") for t in toks)
+            if not (has_v and has_i):
+                continue
+            # Named header found: resolve the voltage and current columns.
+            x_col = next((j for j, t in enumerate(toks)
+                          if t.startswith("vf") or t.startswith("vg")), 0)
+            # Prefer the source current 'Is' (matches the new format's IS_A);
+            # otherwise fall back to the last column of the row.
+            y_col = next((j for j, t in enumerate(toks) if t == "is"), None)
+            if y_col is None:
+                y_col = len(toks) - 1
+            for row in lines[idx + 1:]:
+                s = row.strip()
+                if not s:
+                    continue
+                parts = s.split(sep) if sep else s.split()
+                if len(parts) <= max(x_col, y_col):
+                    continue
+                try:
+                    x = float(parts[x_col].strip().replace(",", "."))
+                    y = float(parts[y_col].strip().replace(",", "."))
+                except ValueError:
+                    continue
+                vg.append(x)
+                ids.append(y)
+            if len(vg) >= 2:
+                return np.asarray(vg, dtype=float), np.asarray(ids, dtype=float)
+            # Header matched but no parseable data: reset and fall through.
+            vg, ids = [], []
+            break
+        # 3) Generic two-column text file.
+        for line in lines:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            # Prefer whitespace-separated columns (like the lab's instrument
+            # files, which may use a comma as the decimal separator); fall
+            # back to a comma-separated table with dot decimals.
+            parts = s.replace(",", ".").split()
+            if len(parts) < 2:
+                parts = s.split(",")
+            if len(parts) < 2:
+                continue
+            try:
+                x, y = float(parts[0]), float(parts[1])
+            except ValueError:
+                continue
+            vg.append(x)
+            ids.append(y)
         return np.asarray(vg, dtype=float), np.asarray(ids, dtype=float)
     @staticmethod
     def _da_sensor_from_filename(path: str, fallback: int) -> int:
@@ -1310,11 +1281,21 @@ class GratmaApp:
         return ((fallback - 1) % 8) + 1
     @staticmethod
     def _da_rep_from_filename(path: str) -> int:
-        """Guesses the 1-based repetition of a data file from the export
-        naming <sample>_<sensor>_<type>_<rep>_<extra>.csv: the repetition is
-        the SECOND numeric token after the sample name (the first one is the
-        sensor). Returns 1 when the name does not follow the pattern."""
+        """Guesses the 1-based repetition of a data file from its name.
+
+        Priority 1 — the old GRATMA / general convention: a trailing '-N'
+        suffix (…-1, …-2, …-3). This is what makes the R1..Rn checkboxes
+        appear for those files.
+
+        Priority 2 — the app CSV export naming
+        <sample>_<sensor>_<type>_<rep>_<extra>.csv: the repetition is the
+        SECOND numeric token after the sample name (the first is the sensor).
+
+        Returns 1 when the name matches neither pattern."""
         name = os.path.splitext(os.path.basename(path))[0]
+        m = re.search(r"-(\d+)$", name)
+        if m:
+            return int(m.group(1))
         nums: list[int] = []
         for tok in name.split("_")[1:]:
             t = tok.upper().lstrip("SR")
@@ -1390,6 +1371,35 @@ class GratmaApp:
             label.set_fontweight("bold")
         ax.set_xlabel(xlabel, fontsize=14, fontweight="bold", labelpad=8)
         ax.set_ylabel(ylabel, fontsize=14, fontweight="bold", labelpad=8)
+    def _da_source_label(self) -> str:
+        """Header text describing where the loaded data comes from:
+        'GRATMA nuevo' (CSV), 'GRATMA antiguo' (TXT) or both when mixed."""
+        srcs = set(self._da_curve_sources)
+        if srcs == {"csv"}:
+            return "GRATMA nuevo"
+        if srcs == {"txt"}:
+            return "GRATMA antiguo"
+        if srcs:
+            return "GRATMA nuevo + antiguo"
+        return ""
+
+    def _da_apply_header(self, fig) -> float:
+        """Puts a bold header at the very top of the figure with the data
+        source (new/old GRATMA) and the wafer/chip text. Returns the top
+        margin to reserve for it in tight_layout (1.0 when there is none)."""
+        bits: list[str] = []
+        src = self._da_source_label()
+        if src:
+            bits.append(src)
+        wc = self._da_wafer_chip.get().strip() if hasattr(self, "_da_wafer_chip") else ""
+        if wc:
+            bits.append(wc)
+        if not bits:
+            return 1.0
+        fig.suptitle("      ".join(bits), fontsize=15, fontweight="bold",
+                     color="#111111", y=0.985)
+        return 0.92
+
     def _da_render(self) -> None:
         """Draws the currently-selected analysis plot from the loaded curves."""
         kind = self._da_plot_kind.get()
@@ -1401,9 +1411,11 @@ class GratmaApp:
         # AND whose repetition is ticked in "Repetitions to represent".
         selected = {i + 1 for i, v in enumerate(self._da_sensor_vars) if v.get()}
         selected_reps = {r for r, v in self._da_rep_vars.items() if v.get()}
-        curves = [c for c, s, r in zip(self._da_curves, self._da_curve_sensors,
-                                       self._da_curve_reps)
-                  if s in selected and r in selected_reps]
+        _sel = [(c, s) for c, s, r in zip(self._da_curves, self._da_curve_sensors,
+                                          self._da_curve_reps)
+                if s in selected and r in selected_reps]
+        curves = [c for c, s in _sel]
+        curve_sensors = [s for c, s in _sel]
         # 'Mean': per-sensor average of ALL kept repetitions. In the curve
         # views it is overlaid as a thicker line; in Mean±std / Dirac violin
         # the averaged curves REPLACE the individual repetitions.
@@ -1423,26 +1435,48 @@ class GratmaApp:
                     ha="center", va="center", fontsize=13, color="#555555",
                     transform=ax.transAxes)
             ax.set_xticks([]); ax.set_yticks([])
-            fig.tight_layout()
+            top = self._da_apply_header(fig)
+            fig.tight_layout(rect=[0, 0, 1, top])
             self._da_canvas.draw()
             return
         n = len(curves)
-        cmap = self._da_cmap(n)
         if kind in ("Forward curves", "Backward curves"):
             forward = (kind == "Forward curves")
-            for idx, (vf, if_, vb, ib) in enumerate(curves):
+            # One fixed colour per sensor (1-8). Curves of the same sensor
+            # share the colour; a legend maps each colour to its sensor.
+            legend_sensors: dict[int, str] = {}
+            for (vf, if_, vb, ib), s in zip(curves, curve_sensors):
                 v = vf if forward else vb
                 i = if_ if forward else ib
-                ax.plot(v, i, color=cmap(idx % 10),
-                        alpha=0.55 if mean_curves else 1.0)
+                color = SENSOR_COLORS[(s - 1) % len(SENSOR_COLORS)]
+                # Label only the first curve of each sensor (so the legend has
+                # one entry per sensor, not one per repetition).
+                lbl = None
+                if s not in legend_sensors:
+                    lbl = f"S{s}"
+                    legend_sensors[s] = color
+                ax.plot(v, i, color=color, label=lbl,
+                        alpha=0.55 if mean_curves else 0.9)
             # Overlay the per-sensor mean of all repetitions (thicker line).
             for s, (vf, if_, vb, ib) in mean_curves:
                 v = vf if forward else vb
                 i = if_ if forward else ib
-                ax.plot(v, i, color=cmap((s - 1) % 10), linewidth=2.8,
-                        label=f"S{s} mean")
-            if mean_curves:
-                leg = ax.legend(fontsize=11, frameon=False)
+                color = SENSOR_COLORS[(s - 1) % len(SENSOR_COLORS)]
+                lbl = None
+                if s not in legend_sensors:
+                    lbl = f"S{s}"
+                    legend_sensors[s] = color
+                ax.plot(v, i, color=color, linewidth=2.8, label=lbl)
+            if legend_sensors:
+                # Order the legend by sensor number.
+                handles, labels = ax.get_legend_handles_labels()
+                order = sorted(range(len(labels)),
+                               key=lambda k: int(labels[k].lstrip("S")))
+                leg = ax.legend([handles[k] for k in order],
+                                [labels[k] for k in order],
+                                title="Sensor", fontsize=11, frameon=False,
+                                ncol=2 if len(order) > 4 else 1)
+                leg.get_title().set_fontweight("bold")
                 for text in leg.get_texts():
                     text.set_fontweight("bold")
             ax.set_title(f"{'Forward' if forward else 'Backward'} curves "
@@ -1509,7 +1543,8 @@ class GratmaApp:
                 tick.set_fontweight("bold")
             for spine in ax.spines.values():
                 spine.set_linewidth(2.2)
-        fig.tight_layout()
+        top = self._da_apply_header(fig)
+        fig.tight_layout(rect=[0, 0, 1, top])
         self._da_canvas.draw()
     def _on_da_save_plot(self) -> None:
         if not self._da_curves:
@@ -1527,25 +1562,36 @@ class GratmaApp:
             self._log_write(f"Error saving plot: {e}", RED)
     # File-name suffix for each plot type when using "Save all PNG".
     _DA_SAVE_ALL_SUFFIXES = {
-        "Forward curves": "Forward curves",
-        "Backward curves": "Reverse curves",
-        "Mean ± std": "Mean std",
-        "Dirac violin": "Dirac violin",
+        "Forward curves": "forward",
+        "Backward curves": "backward",
+        "Mean ± std": "mean",
+        "Dirac violin": "dirac",
     }
+    @staticmethod
+    def _safe_filename(text: str) -> str:
+        """Turns arbitrary text (e.g. the wafer/chip box) into a safe file
+        name: spaces collapse to '_' and any other odd character is dropped."""
+        text = text.strip()
+        text = re.sub(r"\s+", "_", text)
+        text = re.sub(r"[^0-9A-Za-z._\-]", "", text)
+        return text.strip("_-") or ""
     def _on_da_save_all(self) -> None:
-        """Saves the four available plots as PNG in the folder of the loaded
-        data files, automatically named as <data name>_<plot type>.png
-        (Forward curves, Reverse curves, Mean std, Dirac violin). The
-        'Sensors to represent' selection is honoured."""
+        """Saves the four available plots as PNG, automatically named as
+        <wafer/chip>_<forward|backward|mean|dirac>.png. The base name is
+        taken from the "Wafer / Chip" box (falling back to the loaded file
+        names when it is empty). The 'Sensors to represent' selection is
+        honoured."""
         if not self._da_curves:
             messagebox.showinfo("Data Analysis", "There is no data loaded yet.")
             return
-        # Base name = common prefix of the loaded data file names (i.e. the
-        # name the data was saved with); folder = where those files live.
-        names = [os.path.splitext(os.path.basename(p))[0] for p in self._da_files]
-        base = os.path.commonprefix(names).rstrip("_- ") if names else ""
+        # Base name = the wafer/chip box text; if empty, fall back to the
+        # common prefix of the loaded data file names.
+        base = self._safe_filename(self._da_wafer_chip.get())
         if not base:
-            base = names[0] if names else "analysis"
+            names = [os.path.splitext(os.path.basename(p))[0] for p in self._da_files]
+            base = (os.path.commonprefix(names).rstrip("_- ") if names else "")
+            if not base:
+                base = names[0] if names else "analysis"
         folder = os.path.dirname(self._da_files[0]) if self._da_files else ""
         if not folder or not os.path.isdir(folder):
             folder = filedialog.askdirectory(title="Folder for the PNG files")
@@ -1914,13 +1960,11 @@ class GratmaApp:
             if not sensors_list:
                 raise ValueError("Select at least one sensor")
             self._cur_sample = self._sample_name.get().strip() or "sample"
-            self._cur_vs_v = None  # set per-type below (used by ratiometric display)
             self._cur_extra = self._extra_text.get().strip()
             self._cur_sensors = sensors_list
             self._cur_parallel = parallel
             if meas_type == "iv_parametric":
                 vs = int(self._iv_vs.get())
-                self._cur_vs_v = vs / 1000.0
                 vg_start = int(self._iv_vg_start.get())
                 vg_end = int(self._iv_vg_end.get())
                 vg_step = int(self._iv_vg_step.get())
@@ -1947,7 +1991,6 @@ class GratmaApp:
                 self._run_async(self._meas_idt_worker, sensors_list, vg, vs, total, period, parallel)
             elif meas_type == "differential":
                 vs = int(self._iv_vs.get())
-                self._cur_vs_v = vs / 1000.0
                 vg_start = int(self._iv_vg_start.get())
                 vg_end = int(self._iv_vg_end.get())
                 vg_step = int(self._iv_vg_step.get())
@@ -1963,7 +2006,6 @@ class GratmaApp:
                                 vs, vg_start, vg_end, vg_step, mask, reverse, reps, parallel)
             elif meas_type == "iv_randomised":
                 vs = int(self._iv_vs.get())
-                self._cur_vs_v = vs / 1000.0
                 vg_start = int(self._iv_vg_start.get())
                 vg_end = int(self._iv_vg_end.get())
                 vg_step = int(self._iv_vg_step.get())
@@ -1993,7 +2035,6 @@ class GratmaApp:
                                 gnd_unselected)
             elif meas_type == "test_paco":
                 vs = int(self._iv_vs.get())
-                self._cur_vs_v = vs / 1000.0
                 vg_start = int(self._iv_vg_start.get())
                 vg_end = int(self._iv_vg_end.get())
                 vg_step = int(self._iv_vg_step.get())
@@ -2059,12 +2100,6 @@ class GratmaApp:
                 if attempt > retries:
                     raise
                 errno = getattr(e, 'errno', '?')
-                # Mark that this sweep hit a USB glitch: a GET_DATA whose USB
-                # reply timed out may have popped a record from the firmware
-                # buffer that never reached us (destructive read) — so a
-                # missing point here is a lost-in-transit point, recoverable
-                # from the device console, NOT a firmware early stop.
-                self._stream_usb_glitch = True
                 self._log_write(
                     f"⚠ USB problem (errno={errno}): {e} — retry "
                     f"{attempt}/{retries} in {wait_s:.1f} s (the device keeps "
@@ -2079,7 +2114,6 @@ class GratmaApp:
         (in which case sends STOP to firmware).
         """
         all_records: list[dict] = []
-        self._stream_usb_glitch = False  # reset per-sweep glitch tracker
         def drain_pending() -> bool:
             found_end = False
             while self._usb_call(self._dev.get_data_count) > 0:
@@ -2177,20 +2211,6 @@ class GratmaApp:
                     f"Check the VG DAC calibration/reference/gain (GRATMA tab: "
                     f"Set VG {vg_end} and read INA228[1] Vbus to confirm).", ORANGE)
                 return
-            missing = expected - n_fwd
-            if self._stream_usb_glitch:
-                # A USB timeout occurred during THIS sweep: the missing
-                # point(s) were measured by the device but lost in the
-                # timed-out (destructive) GET_DATA transfer, not skipped by
-                # the firmware. They should be in the device-console lines
-                # (CONSOLE| ...) of the terminal recovery .txt file.
-                self._log_write(
-                    f"⚠ {label}{missing} forward point(s) missing ({n_fwd}/{expected}) "
-                    f"after a USB timeout during this sweep: the point(s) were "
-                    f"measured but LOST in the timed-out transfer, not skipped by "
-                    f"the firmware. Recover them from the CONSOLE| lines of the "
-                    f"terminal recovery file (gratma_terminal_*.txt).", ORANGE)
-                return
             self._log_write(
                 f"⚠ {label}only {n_fwd}/{expected} forward points received and "
                 f"last VG = {vg_max_mv:.0f} mV < {vg_end} mV — the sweep stopped "
@@ -2199,51 +2219,7 @@ class GratmaApp:
         self._log_write(
             f"⚠ {label}last VG measured = {vg_max_mv:.0f} mV but "
             f"VG end = {vg_end} mV.", ORANGE)
-    # -- Acquisition quality metrics ------------------------------------------
-    @staticmethod
-    def _sweep_quality_stats(pts: list[dict]) -> list[dict]:
-        """Per-sensor acquisition metrics from the forward points of the first
-        repetition: point noise via 2nd differences (removes the curve trend),
-        VS dither and the ΔIs–ΔVs correlation. A high correlation means the
-        noise is BIAS-limited (drain dither), so it improves with averaging /
-        settle / VS filtering — not with more points."""
-        out: list[dict] = []
-        groups: dict[int, list[dict]] = {}
-        for p in pts:
-            if not p.get("backward"):
-                key = p["sensor"]
-                if (p.get("rep", 1) or 1) == min(pp.get("rep", 1) or 1 for pp in pts):
-                    groups.setdefault(key, []).append(p)
-        for sensor, recs in sorted(groups.items()):
-            if len(recs) < 10:
-                continue
-            recs = sorted(recs, key=lambda r: r["seq"])
-            try:
-                is_ua = np.array([r["v2"] for r in recs]) * 1e6
-                vs_mv = np.array([r.get("v3", 0.0) for r in recs]) * 1e3
-                noise = float(np.std(np.diff(is_ua, 2)) / np.sqrt(6))
-                vs_dither = float(np.std(np.diff(vs_mv)) / np.sqrt(2))
-                dI, dV = np.diff(is_ua), np.diff(vs_mv)
-                corr = float(np.corrcoef(dI, dV)[0, 1]) if dV.std() > 0 else 0.0
-                out.append({"sensor": sensor, "noise_ua": noise,
-                            "vs_dither_mv": vs_dither, "corr": corr})
-            except Exception:
-                continue
-        return out
-    def _log_sweep_quality(self, pts: list[dict]) -> None:
-        """Logs the acquisition quality metrics after an I-V measurement."""
-        for q in self._sweep_quality_stats(pts):
-            verdict = ""
-            if q["corr"] >= 0.5:
-                verdict = "  → bias-limited (VS dither): use averaging/settle, filter VS"
-            elif q["corr"] <= 0.2 and q["noise_ua"] > 1.0:
-                verdict = "  → ADC/sensor-limited: increase averaging/conv. time"
-            self._log_write(
-                f"  quality S{q['sensor']}: noise {q['noise_ua']:.2f} µA rms | "
-                f"VS dither {q['vs_dither_mv']:.2f} mV | corr(ΔI,ΔV)={q['corr']:.2f}"
-                + verdict, CYAN)
     def _meas_iv_param_worker(self, vs, vg_start, vg_end, vg_step, mask, reverse, reps, parallel) -> None:
-        self._apply_meas_config()
         mode = "parallel" if parallel else "sequential"
         self._log_write(
             f"I-V ({mode}): VS={vs}mV  VG={vg_start}→{vg_end}mV  step={vg_step}mV  "
@@ -2273,7 +2249,6 @@ class GratmaApp:
         }
         self._rq.put(("meas_done", {"type": "iv", "records": pts, "result": result, "meta": meta}))
     def _meas_idt_worker(self, sensors_list, vg, vs, total, period, parallel) -> None:
-        self._apply_meas_config()
         mode = "parallel" if parallel else "sequential"
         self._log_write(
             f"IDT ({mode}): sensors={sensors_list}  VG={vg}mV  VS={vs}mV  "
@@ -2314,7 +2289,6 @@ class GratmaApp:
                 all_samples.extend(r for r in records if r["type"] == RecordType.IDT_SAMPLE)
         self._rq.put(("meas_done", {"type": "idt", "records": all_samples, "result": None}))
     def _meas_differential_worker(self, vs, vg_start, vg_end, vg_step, mask, reverse, reps, parallel) -> None:
-        self._apply_meas_config()
         def start_phase():
             self._dev.start_sweep_ex(
                 vs_mv=vs, vg_start_mv=vg_start, vg_end_mv=vg_end,
@@ -2480,7 +2454,6 @@ class GratmaApp:
     def _meas_iv_random_worker(self, vs, vg_start, vg_end, vg_step, sensors_list,
                                reverse, stab_s, settle_s, discard, reps, random_mode,
                                gnd_unselected) -> None:
-        self._apply_meas_config()
         total_seq = discard + reps
         self._log_write(
             f"I-V Randomised: VS(Vd)={vs}mV  VG={vg_start}→{vg_end}mV  step={vg_step}mV  "
@@ -2627,7 +2600,6 @@ class GratmaApp:
           iv:            single-sensor sweep
           vd_con_apply:  drain back to 0 V → ALL drains connected (grounded)
         so all drains are grounded before and after measuring each sensor."""
-        self._apply_meas_config()
         total_seq = discard + reps
         self._log_write(
             f"Test Paco: VS(Vd)={vs}mV  VG={vg_start}→{vg_end}mV  step={vg_step}mV  "
@@ -2784,7 +2756,6 @@ class GratmaApp:
             if result is not None:
                 self._meas_result_lbl.config(text=f"VG_min = {result:.4f} V")
             self._log_write(f"I-V completed — {len(data['records'])} points", GREEN)
-            self._log_sweep_quality(data["records"])
         elif meas_type in ("iv_random", "test_paco"):
             self._sweep_records = data["records"]
             n_sensors = data.get("n_sensors", "?")
@@ -2794,7 +2765,6 @@ class GratmaApp:
             self._log_write(
                 f"{name} completed — {len(data['records'])} points "
                 f"({n_reps} reps kept per sensor)", GREEN)
-            self._log_sweep_quality(data["records"])
         elif meas_type == "idt":
             self._idt_records = data["records"]
             self._log_write(f"IDT completed — {len(data['records'])} samples", GREEN)
@@ -2839,8 +2809,6 @@ class GratmaApp:
         """Appends records (in arrival order) to the accumulated series for
         (phase, sensor). Each point keeps its own forward/backward flag so
         the plot can later split the line wherever direction changes."""
-        ratio_on = (self._rt_kind != "idt" and self._ratio_correction.get()
-                    and self._cur_vs_v)
         for r in records:
             key = (phase, r["sensor"])
             if self._rt_kind == "idt":
@@ -2849,14 +2817,7 @@ class GratmaApp:
             else:
                 x = r["v1"]
                 backward = bool(r.get("backward", False))
-            y = r["v2"]
-            # Ratiometric VS correction: scale Is by the drain voltage actually
-            # measured at this point (v3). Physical correction, not smoothing.
-            if ratio_on:
-                v3 = r.get("v3") or 0.0
-                if v3 > 1e-4:
-                    y = r["v2"] * (self._cur_vs_v / v3)
-            self._rt_series.setdefault(key, []).append((x, y, backward))
+            self._rt_series.setdefault(key, []).append((x, r["v2"], backward))
     _RT_TITLES = {
         "iv": "I-V Curve",
         "manual": "Manual Measurement",
@@ -2887,8 +2848,6 @@ class GratmaApp:
         ax = self._meas_ax
         ax.clear()
         title = self._RT_TITLES.get(self._rt_kind, "Measurement")
-        if self._rt_kind != "idt" and self._ratio_correction.get():
-            title += " (VS-corrected)"
         if not final:
             title += " — Real-time"
             if self._rt_progress:
@@ -2987,33 +2946,13 @@ class GratmaApp:
             parts.append(extra)
         return os.path.join(self._out_folder.get().strip(), "_".join(parts) + ".csv")
     @staticmethod
-    def _write_iv_csv(path: str, recs: list[dict], meta: dict | None = None,
-                      ratio_vs_v: 'float | None' = None) -> None:
+    def _write_iv_csv(path: str, recs: list[dict], meta: dict | None = None) -> None:
         """Writes an I-V CSV: a metadata block with the measurement
-        conditions, a blank line, and the data table. The first four columns
-        (VG_V, IS_A, VS_V, IG_A) are the RAW data, unchanged. Two extra
-        columns are appended at the end (so older tools keep working):
-          VG_SET_V   — the setpoint VG grid, reconstructed from the arrival
-                       order within each sweep direction (removes the x-axis
-                       jitter of the measured VG when plotting against it).
-          IS_RATIO_A — only when the ratiometric correction is enabled:
-                       Is·(VS_set / VS_measured), a physical correction of
-                       the drain-bias dither (NOT smoothing)."""
+        conditions (date/time, VS, VG start/end/step, repetitions, reverse
+        sweep), a blank line, and then the data table (VG_V, IS_A, VS_V,
+        IG_A — point number and direction are not exported)."""
         meta = meta or {}
         recs = sorted(recs, key=lambda r: (bool(r.get("backward")), r["seq"]))
-        # Setpoint grid from the sweep parameters (when available)
-        try:
-            vg0 = float(meta.get("vg_start_mv")) / 1000.0
-            vg1 = float(meta.get("vg_end_mv")) / 1000.0
-            stp = float(meta.get("vg_step_mv")) / 1000.0
-            have_grid = stp > 0
-        except (TypeError, ValueError):
-            have_grid = False
-        header = ["VG_V", "IS_A", "VS_V", "IG_A"]
-        if have_grid:
-            header.append("VG_SET_V")
-        if ratio_vs_v:
-            header.append("IS_RATIO_A")
         with open(path, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["Date", meta.get("timestamp", "")])
@@ -3024,20 +2963,9 @@ class GratmaApp:
             w.writerow(["Repetitions", meta.get("reps", "")])
             w.writerow(["Reverse_sweep", "Y" if meta.get("reverse") else "N"])
             w.writerow([])
-            w.writerow(header)
-            fwd_i = bwd_i = 0
+            w.writerow(["VG_V", "IS_A", "VS_V", "IG_A"])
             for r in recs:
-                row = [r["v1"], r["v2"], r.get("v3", 0.0), r.get("v4", 0.0)]
-                if have_grid:
-                    if r.get("backward"):
-                        vset = max(vg1 - bwd_i * stp, min(vg0, vg1)); bwd_i += 1
-                    else:
-                        vset = min(vg0 + fwd_i * stp, max(vg0, vg1)); fwd_i += 1
-                    row.append(round(vset, 6))
-                if ratio_vs_v:
-                    v3 = r.get("v3") or 0.0
-                    row.append(r["v2"] * (ratio_vs_v / v3) if v3 > 1e-4 else r["v2"])
-                w.writerow(row)
+                w.writerow([r["v1"], r["v2"], r.get("v3", 0.0), r.get("v4", 0.0)])
     @staticmethod
     def _write_idt_csv(path: str, recs: list[dict]) -> None:
         recs = sorted(recs, key=lambda r: r["seq"])
@@ -3053,13 +2981,6 @@ class GratmaApp:
         Returns the paths written. With dry_run=True it only returns the
         target paths without writing anything (used by the overwrite guard)."""
         written: list[str] = []
-        # Ratiometric column only when the option is ticked and VS is known
-        ratio_vs_v = None
-        try:
-            if meta and self._ratio_correction.get() and meta.get("vs_mv") not in (None, ""):
-                ratio_vs_v = float(meta.get("vs_mv")) / 1000.0
-        except (TypeError, ValueError):
-            ratio_vs_v = None
         if self._cur_parallel:
             sensor_tok = "P" + "-".join(str(s) for s in self._cur_sensors)
             groups: dict[int, list[dict]] = {}
@@ -3068,7 +2989,7 @@ class GratmaApp:
             for rep, recs in sorted(groups.items()):
                 path = self._csv_path(sensor_tok, type_tok, rep)
                 if not dry_run:
-                    self._write_iv_csv(path, recs, meta, ratio_vs_v)
+                    self._write_iv_csv(path, recs, meta)
                 written.append(path)
         else:
             groups2: dict[tuple[int, int], list[dict]] = {}
@@ -3077,7 +2998,7 @@ class GratmaApp:
             for (sensor, rep), recs in sorted(groups2.items()):
                 path = self._csv_path(f"{sensor}", type_tok, rep)
                 if not dry_run:
-                    self._write_iv_csv(path, recs, meta, ratio_vs_v)
+                    self._write_iv_csv(path, recs, meta)
                 written.append(path)
         return written
     def _idt_target_paths(self, data: dict) -> list[str]:
