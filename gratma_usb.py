@@ -27,6 +27,7 @@ Protocolo (device -> host):
 import os
 import platform
 import struct
+import threading
 import time
 import usb.core
 import usb.util
@@ -145,11 +146,9 @@ class RecordType:
     IDT_SAMPLE  = 0x03   # (Vs_bus, Is, Vg, Ig) — una muestra IDT
     IDT_END     = 0x04   # fin del IDT (seq=total_samples, v1..v4=0)
 
-RECORD_SIZE = 23  # bytes por registro en el wire format
+RECORD_SIZE = 24  # bytes por registro en el wire format  (firmware >= v2.0.2)
 RECORDS_PER_PACKET = 2  # registros que caben en un paquete USB de 64 bytes
 
-# Bit 7 del byte 'sensor' del registro: el punto pertenece a la fase backward
-SENSOR_BACKWARD_FLAG = 0x80
 
 # ---------------------------------------------------------------------------
 # Excepciones
@@ -185,6 +184,14 @@ class GratmaUSB:
         self._pid = pid
         self._timeout = timeout_ms
         self._dev: usb.core.Device | None = None
+        # Serializa TODOS los comandos (ping, polling de datos, etc.) para
+        # evitar que dos hilos escriban/lean el mismo endpoint EP_OUT/EP_IN
+        # a la vez. Sin esto, el ping automático (hilo aparte) puede
+        # entrelazarse con el polling de datos de una medición y provocar
+        # timeouts intermitentes (errno=10060) aunque el device siga
+        # conectado: uno de los dos read() se queda esperando una respuesta
+        # que en realidad ha "consumido" el otro hilo.
+        self._lock = threading.RLock()
 
     # ------------------------------------------------------------------
     # Context manager
@@ -375,10 +382,17 @@ class GratmaUSB:
         return status, data
 
     def _cmd(self, cmd: int, payload: bytes = b"") -> bytes:
-        """Envía un comando y recibe la respuesta. Devuelve los bytes de datos."""
-        self._send(cmd, payload)
-        _, data = self._recv(cmd)
-        return data
+        """Envía un comando y recibe la respuesta. Devuelve los bytes de datos.
+
+        Serializado con self._lock: es el único punto de entrada real a la
+        comunicación USB (todas las llamadas de alto nivel pasan por aquí),
+        así que basta con proteger esta función para que ping(), get_data(),
+        get_status(), etc. nunca se entrelacen entre hilos distintos.
+        """
+        with self._lock:
+            self._send(cmd, payload)
+            _, data = self._recv(cmd)
+            return data
 
     # ------------------------------------------------------------------
     # Comandos de alto nivel
@@ -582,12 +596,12 @@ class GratmaUSB:
         records = []
         offset = 0
         while offset + RECORD_SIZE <= len(data):
-            rec_type, sensor_raw, rep, seq, v1, v2, v3, v4 = struct.unpack_from(
-                "<BBBIffff", data, offset)
+            rec_type, sensor, backward, rep, seq, v1, v2, v3, v4 = struct.unpack_from(
+                "<BBBBIffff", data, offset)
             records.append({
                 "type":     rec_type,
-                "sensor":   sensor_raw & ~SENSOR_BACKWARD_FLAG,
-                "backward": bool(sensor_raw & SENSOR_BACKWARD_FLAG),
+                "sensor":   sensor,
+                "backward": bool(backward),
                 "rep":      rep,
                 "seq":      seq,
                 "v1":       v1,

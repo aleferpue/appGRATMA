@@ -1,8 +1,8 @@
 """
-app_v4.py — GRATMA v3.4.0 Desktop Application (tkinter + matplotlib)
+app_v3.py — GRATMA v3.4.0 Desktop Application (tkinter + matplotlib)
 
 Improvements v3.4.0:
-    - New "Test Paco" measurement type: like I-V Randomised but with the
+    - New "IV - drain grounding test" measurement type: like I-V Randomised but with the
       random order and GND-unselected behaviours ALWAYS active (no checkbox
       needed), and with a drain cycle around every sensor: all drains are
       grounded (0 V, all switches connected) before and after each sensor;
@@ -120,12 +120,12 @@ SENSOR_COLORS = [
     "#f59f00",  # S7 yellow
     "#d6336c",  # S8 pink
 ]
-# Per-sensor drain switch maps used by the "Test Paco" mode: sensor
+# Per-sensor drain switch maps used by the "IV - drain grounding test" mode: sensor
 # (1-based) -> (map for SW0, map for SW1), written to the MAX14662 to
 # pre-select the sensor's drain while VD settles before its sweep.
 # Default: bit N-1 on both switches. EDIT THIS TABLE if the board wiring
 # uses different maps (equivalent to DRAIN_SENSOR_MAPS in the console script).
-TESTPACO_DRAIN_SENSOR_MAPS = {s: (1 << (s - 1), 1 << (s - 1)) for s in range(1, 9)}
+TESTIV_DRAIN_GND_DRAIN_SENSOR_MAPS = {s: (1 << (s - 1), 1 << (s - 1)) for s in range(1, 9)}
 # ---------------------------------------------------------------------------
 # Terminal recovery log
 # ---------------------------------------------------------------------------
@@ -467,7 +467,7 @@ class GratmaApp:
             ("idt", "I vs Time (IDT)"),
             ("differential", "Differential Two Points"),
             ("iv_randomised", "I-V Randomised"),
-            ("test_paco", "Test Paco"),
+            ("IV_drain_grounding", "IV - drain grounding test"),
         ]
         for val, lbl in types:
             ttk.Radiobutton(type_frame, text=lbl, variable=self._meas_type,
@@ -602,7 +602,7 @@ class GratmaApp:
                      "the bottom group (5-8). Uncheck for plain sequential order.\n"
                      "GND unselected: while a sensor is measured, every other source\n"
                      "is tied to ground (firmware cmd 0x14; unchecked = left open).")
-        elif meas_type == "test_paco":
+        elif meas_type == "IV_drain_grounding":
             # Random order and GND-unselected are ALWAYS active in this mode,
             # so the checkboxes are hidden instead of required.
             self._par_radio.pack_forget()
@@ -610,7 +610,7 @@ class GratmaApp:
             self._gnd_check.pack_forget()
             self._sensor_mode.set("sequential")
             self._mode_hint.config(
-                text="Test Paco: random order (alternating top 1-4 / bottom 5-8) and\n"
+                text="IV - drain grounding test: random order (alternating top 1-4 / bottom 5-8) and\n"
                      "GND unselected are ALWAYS active — no checkbox needed. All\n"
                      "drains are grounded (0 V, all connected) before and after\n"
                      "measuring each sensor.")
@@ -691,18 +691,18 @@ class GratmaApp:
         elif meas_type == "iv_randomised":
             self._params_iv_param.pack(fill=X, pady=6)
             self._params_random.pack(fill=X, pady=6)
-        elif meas_type == "test_paco":
+        elif meas_type == "IV_drain_grounding":
             self._params_iv_param.pack(fill=X, pady=6)
             self._params_random.pack(fill=X, pady=6)
             # Load the recommended defaults for this mode.
-            self._apply_test_paco_defaults()
+            self._apply_IV_drain_grounding_defaults()
         # Swap Parallel radio <-> Random checkbox depending on the type
         self._update_sensor_mode_widgets()
-    # Default I-V parameters applied when the "Test Paco" type is selected.
-    _TEST_PACO_IV_DEFAULTS = {"vs": 50, "vg_start": 0, "vg_end": 1200,
+    # Default I-V parameters applied when the "IV - drain grounding test" type is selected.
+    _IV_drain_grounding_IV_DEFAULTS = {"vs": 50, "vg_start": 0, "vg_end": 1200,
                               "vg_step": 15, "reps": 3}
-    def _apply_test_paco_defaults(self) -> None:
-        d = self._TEST_PACO_IV_DEFAULTS
+    def _apply_IV_drain_grounding_defaults(self) -> None:
+        d = self._IV_drain_grounding_IV_DEFAULTS
         self._iv_vs.set(str(d["vs"]))
         self._iv_vg_start.set(str(d["vg_start"]))
         self._iv_vg_end.set(str(d["vg_end"]))
@@ -1520,7 +1520,7 @@ class GratmaApp:
         # Reset real-time graph
         self._rt_kind = {
             "iv_parametric": "iv", "idt": "idt", "differential": "differential",
-            "iv_randomised": "iv", "test_paco": "iv",
+            "iv_randomised": "iv", "IV_drain_grounding": "iv",
         }[meas_type]
         self._rt_series = {}
         self._render_meas_plot(final=False)
@@ -1604,7 +1604,7 @@ class GratmaApp:
                                 vs, vg_start, vg_end, vg_step, sensors_list, reverse,
                                 stab_s, settle_s, discard, reps, random_mode,
                                 gnd_unselected)
-            elif meas_type == "test_paco":
+            elif meas_type == "IV_drain_grounding":
                 vs = int(self._iv_vs.get())
                 vg_start = int(self._iv_vg_start.get())
                 vg_end = int(self._iv_vg_end.get())
@@ -1622,13 +1622,13 @@ class GratmaApp:
                     raise ValueError("Repetitions must be >= 1")
                 if discard < 0:
                     raise ValueError("Measures to discard must be >= 0")
-                # Test Paco never runs in parallel; random order and
+                # IV - drain grounding test never runs in parallel; random order and
                 # GND-unselected are forced inside the worker.
                 self._cur_parallel = False
                 self._set_busy(True)
                 if self._recorder:
                     self._recorder.meas_started()
-                self._run_async(self._meas_test_paco_worker,
+                self._run_async(self._meas_IV_drain_grounding_worker,
                                 vs, vg_start, vg_end, vg_step, sensors_list, reverse,
                                 stab_s, settle_s, discard, reps)
         except ValueError as e:
@@ -2099,10 +2099,10 @@ class GratmaApp:
             "type": "iv_random", "records": kept, "result": None, "meta": meta,
             "n_sensors": len(sensors_list), "n_reps": reps,
         }))
-    # -- Test Paco -------------------------------------------------------------
-    def _meas_test_paco_worker(self, vs, vg_start, vg_end, vg_step, sensors_list,
+    # -- IV - drain grounding test -------------------------------------------------------------
+    def _meas_IV_drain_grounding_worker(self, vs, vg_start, vg_end, vg_step, sensors_list,
                                reverse, stab_s, settle_s, discard, reps) -> None:
-        """'Test Paco' state machine. Like I-V Randomised, but the random
+        """'IV - drain grounding test' state machine. Like I-V Randomised, but the random
         order and the GND-unselected mode are ALWAYS active, and every
         sensor is wrapped in a drain cycle:
           unselected_sensors_mode: firmware UNSEL_MODE=GND (cmd 0x14, 'um 1')
@@ -2114,14 +2114,14 @@ class GratmaApp:
         so all drains are grounded before and after measuring each sensor."""
         total_seq = discard + reps
         self._log_write(
-            f"Test Paco: VS(Vd)={vs}mV  VG={vg_start}→{vg_end}mV  step={vg_step}mV  "
+            f"IV - drain grounding test: VS(Vd)={vs}mV  VG={vg_start}→{vg_end}mV  step={vg_step}mV  "
             f"sensors={sensors_list}  discard={discard}  keep(reps)={reps}  "
             f"→ {total_seq} sequences  (random + GND unselected forced)", CYAN)
         self._log_vg_end_note(vg_start, vg_end, vg_step)
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         def aborted() -> bool:
             if self._abort_measurement:
-                self._rq.put(("log_warn", "Test Paco aborted by user"))
+                self._rq.put(("log_warn", "IV - drain grounding test aborted by user"))
                 self._rq.put(("busy_off", None))
                 return True
             return False
@@ -2129,7 +2129,7 @@ class GratmaApp:
         gnd_active = True
         try:
             self._dev.set_unsel_mode(UnselMode.GND)
-            self._log_write("Unselected-source mode: GND (always on in Test Paco)", CYAN)
+            self._log_write("Unselected-source mode: GND (always on in IV - drain grounding test)", CYAN)
         except GratmaError as e:
             gnd_active = False
             self._log_write(
@@ -2139,7 +2139,7 @@ class GratmaApp:
         self._log_write(
             f"Waiting {stab_s / 60.0:.2f} min for the system to stabilize ...", ORANGE)
         if not self._sleep_abortable(stab_s):
-            self._rq.put(("log_warn", "Test Paco aborted during stabilization"))
+            self._rq.put(("log_warn", "IV - drain grounding test aborted during stabilization"))
             self._rq.put(("busy_off", None))
             return
         self._dev.set_switch(sw=0, sw_map=0xFF)
@@ -2169,7 +2169,7 @@ class GratmaApp:
                 self._dev.set_switch(sw=1, sw_map=0x00)
                 self._dev.set_voltage(dac=1, out=0, mv=vs)
                 self._dev.set_voltage(dac=1, out=1, mv=vs)
-                map0, map1 = TESTPACO_DRAIN_SENSOR_MAPS[sensor]
+                map0, map1 = TESTIV_DRAIN_GND_DRAIN_SENSOR_MAPS[sensor]
                 self._dev.set_switch(sw=0, sw_map=map0)
                 self._dev.set_switch(sw=1, sw_map=map1)
                 self._log_write(
@@ -2177,7 +2177,7 @@ class GratmaApp:
                     f"drain maps SW0=0x{map0:02X} SW1=0x{map1:02X}", FG_DIM)
                 self._log_write(f"  Waiting drain settle {settle_s:.0f} s ...", FG_DIM)
                 if not self._sleep_abortable(settle_s):
-                    self._rq.put(("log_warn", "Test Paco aborted during drain settle"))
+                    self._rq.put(("log_warn", "IV - drain grounding test aborted during drain settle"))
                     self._rq.put(("busy_off", None))
                     return
                 if gnd_active:
@@ -2194,7 +2194,7 @@ class GratmaApp:
                             f"  Could not read the VS bus voltage: {e}", ORANGE)
                 # Stage "iv": single-sensor sweep.
                 if not self._wait_device_idle():
-                    self._rq.put(("log_warn", "Test Paco aborted by user"))
+                    self._rq.put(("log_warn", "IV - drain grounding test aborted by user"))
                     self._rq.put(("busy_off", None))
                     return
                 self._log_write(f"  Sweeping S{sensor} ...", FG_DIM)
@@ -2206,7 +2206,7 @@ class GratmaApp:
                 records = self._stream_records("iv", RecordType.SWEEP_POINT,
                                                RecordType.SWEEP_END)
                 if records is None:
-                    self._rq.put(("log_warn", "Test Paco aborted by user"))
+                    self._rq.put(("log_warn", "IV - drain grounding test aborted by user"))
                     self._rq.put(("busy_off", None))
                     return
                 pts = [r for r in records if r["type"] == RecordType.SWEEP_POINT]
@@ -2242,7 +2242,7 @@ class GratmaApp:
             "reverse": reverse,
         }
         self._rq.put(("meas_done", {
-            "type": "test_paco", "records": kept, "result": None, "meta": meta,
+            "type": "IV_drain_grounding", "records": kept, "result": None, "meta": meta,
             "n_sensors": len(sensors_list), "n_reps": reps,
         }))
     def _on_measurement_complete(self, data) -> None:
@@ -2264,11 +2264,11 @@ class GratmaApp:
             if result is not None:
                 self._meas_result_lbl.config(text=f"VG_min = {result:.4f} V")
             self._log_write(f"I-V completed — {len(data['records'])} points", GREEN)
-        elif meas_type in ("iv_random", "test_paco"):
+        elif meas_type in ("iv_random", "IV_drain_grounding"):
             self._sweep_records = data["records"]
             n_sensors = data.get("n_sensors", "?")
             n_reps = data.get("n_reps", "?")
-            name = "Test Paco" if meas_type == "test_paco" else "Random I-V"
+            name = "IV - drain grounding test" if meas_type == "IV_drain_grounding" else "Random I-V"
             self._meas_result_lbl.config(text=f"{n_sensors} sensors × {n_reps} reps")
             self._log_write(
                 f"{name} completed — {len(data['records'])} points "
@@ -2498,8 +2498,8 @@ class GratmaApp:
                 written = self._export_iv_phase(data["records"], "iv", data.get("meta"))
             elif meas_type == "iv_random":
                 written = self._export_iv_phase(data["records"], "iv-rnd", data.get("meta"))
-            elif meas_type == "test_paco":
-                written = self._export_iv_phase(data["records"], "paco", data.get("meta"))
+            elif meas_type == "IV_drain_grounding":
+                written = self._export_iv_phase(data["records"], "iv-drain-gnd", data.get("meta"))
             elif meas_type == "differential":
                 written = self._export_iv_phase(data["phase1"], "diff-ph1", data.get("meta1"))
                 written += self._export_iv_phase(data["phase2"], "diff-ph2", data.get("meta2"))
