@@ -48,7 +48,7 @@ import serial
 
 
 FOLDER_PATH = (
-    r"C:\Users\rodri\OneDrive\Escritorio\GRATMA\Medidas_GRATMA"   # Se cambia con respecto al PC que lo use.
+    r"C:\GRATMA\medidas\APS5"   # Se cambia con respecto al PC que lo use.
 )
 
 # ==================== Información de sensores ====================
