@@ -9,7 +9,15 @@ Mejoras añadidas:
        python GRATMA_random_mejorado.py --port COM8 --wafer USAGRAPH1 --chip F5C9
 
      Si falta alguno, el programa lo pregunta de forma interactiva.
-  3. Todos los TXT generados incluyen una cabecera con los parámetros usados
+  3. Cada TXT final se guarda con el formato:
+
+       Wafer_Chip_ArrayN_random_Secuencia_Electrolito.txt
+
+     Ejemplo:
+
+       USAGRAPH1_F5C9_Array3_random_2_PB-S0_01.txt
+
+  4. Todos los TXT generados incluyen una cabecera con los parámetros usados
      en la medida, seguida de las columnas:
 
        Vfg;Id;Ig;Is
@@ -30,7 +38,7 @@ import serial
 
 
 FOLDER_PATH = (
-    r"C:\Users\rodri\OneDrive\Escritorio\GRATMA\Medidas_GRATMA"
+    r"C:\Users\rodri\OneDrive\Escritorio\GRATMA\Medidas_GRATMA"   # Se cambia con respecto al PC que lo use.
 )
 
 # ==================== Información de sensores ====================
@@ -49,8 +57,9 @@ STABILIZE_S = 180
 BETWEEN_SENSORS_S = 10
 GND_UNSELECTED = True
 
-# ==================== Información extra ====================
-INFO_EXTRA = "rnd"
+# ==================== Identificación de los archivos ====================
+MEASUREMENT_MODE = "random"
+ELECTROLYTE = "PB-S0_01"
 BAUDRATE = 115200
 SERIAL_TIMEOUT_S = 1
 MEASUREMENT_TIMEOUT_S = 300
@@ -113,15 +122,39 @@ def sanitize_filename_component(value):
     return re.sub(r'[<>:"/\\|?*]+', "_", value)
 
 
-def build_chip_name(wafer, chip_input):
-    """Construye USAGRAPH1_F5C9 evitando duplicar el nombre del wafer."""
+def normalize_chip_name(wafer, chip_input):
+    """Devuelve solo el chip y elimina el wafer si se escribió como prefijo."""
     wafer = sanitize_filename_component(wafer)
     chip_input = sanitize_filename_component(chip_input)
 
     wafer_prefix = f"{wafer}_"
     if chip_input.upper().startswith(wafer_prefix.upper()):
-        return chip_input
-    return f"{wafer}_{chip_input}"
+        return chip_input[len(wafer_prefix):]
+    return chip_input
+
+
+def build_measurement_filename(
+    wafer,
+    chip,
+    sensor,
+    sequence,
+    electrolyte=ELECTROLYTE,
+):
+    """Construye el nombre definitivo del TXT de una medida."""
+    wafer = sanitize_filename_component(wafer)
+    chip = sanitize_filename_component(chip)
+    electrolyte = sanitize_filename_component(electrolyte)
+
+    return (
+        f"{wafer}_{chip}_Array{sensor}_{MEASUREMENT_MODE}_"
+        f"{sequence}_{electrolyte}.txt"
+    )
+
+
+def build_temporary_txt_filename(final_filename):
+    """Crea un TXT temporal para conservar la salida serie completa."""
+    filename_without_extension = os.path.splitext(final_filename)[0]
+    return f"All_info_{filename_without_extension}.txt"
 
 
 def get_runtime_configuration(args):
@@ -143,7 +176,7 @@ def get_runtime_configuration(args):
         if args.chip
         else prompt_required("Código del chip")
     )
-    chip = build_chip_name(wafer, chip_input)
+    chip = normalize_chip_name(wafer, chip_input)
 
     folder_path = os.path.expandvars(
         os.path.expanduser(args.folder if args.folder else FOLDER_PATH)
@@ -177,9 +210,12 @@ def build_measurement_metadata(
         "wafer": wafer,
         "chip": chip,
         "sensor": sensor,
+        "array": f"Array{sensor}",
         "secuencia": sequence,
         "numero_secuencias_total": NUM_REP,
         "orden_aleatorio_secuencia": ",".join(map(str, random_order)),
+        "modo_medida": MEASUREMENT_MODE,
+        "electrolito": ELECTROLYTE,
         "VD_mV": VD,
         "VGINIT_mV": VGINIT,
         "VGEND_mV": VGEND,
@@ -189,7 +225,6 @@ def build_measurement_metadata(
         "estabilizacion_inicial_s": STABILIZE_S,
         "espera_entre_sensores_s": BETWEEN_SENSORS_S,
         "sensores_no_seleccionados_a_tierra": GND_UNSELECTED,
-        "info_extra": INFO_EXTRA,
     }
 
 
@@ -411,18 +446,17 @@ def save_clean_measurement(output_path, metadata, data_buffer):
 
 
 def split_txt_by_reps(
+    wafer,
     chip,
     sensor,
-    numiter,
-    info_extra,
-    rep_offset,
+    sequence,
+    input_filename,
     folder_path,
     metadata=None,
 ):
-    """Extrae Vfg;Id;Ig;Is y crea un TXT limpio por repetición."""
+    """Extrae Vfg;Id;Ig;Is y crea el TXT definitivo de la medida."""
     os.makedirs(folder_path, exist_ok=True)
 
-    input_filename = f"All_info_{chip}_{sensor}_{numiter}_{info_extra}.txt"
     input_path = os.path.join(folder_path, input_filename)
 
     with open(input_path, "r", encoding="utf-8", errors="ignore") as input_file:
@@ -431,6 +465,7 @@ def split_txt_by_reps(
     repetition = None
     collecting = False
     data_buffer = []
+    saved_filename = None
 
     number = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
     numeric_line_pattern = re.compile(
@@ -438,15 +473,27 @@ def split_txt_by_reps(
     )
 
     def save_current_block(current_repetition, current_buffer):
+        nonlocal saved_filename
+
         if current_repetition is None or not current_buffer:
             return
 
-        output_filename = (
-            f"Id_Vfg__{chip}_{sensor}_{info_extra}_"
-            f"GRATMA-{current_repetition}.txt"
+        if saved_filename is not None:
+            print(
+                "    [WARN] Se ha encontrado más de un bloque de datos; "
+                "solo se conserva el primero."
+            )
+            return
+
+        output_filename = build_measurement_filename(
+            wafer=wafer,
+            chip=chip,
+            sensor=sensor,
+            sequence=sequence,
         )
         output_path = os.path.join(folder_path, output_filename)
         save_clean_measurement(output_path, metadata, current_buffer)
+        saved_filename = output_filename
         print(f"    Guardado: {output_filename}")
 
     for line in lines:
@@ -458,7 +505,7 @@ def split_txt_by_reps(
         )
         if sensor_match:
             sensor_found = int(sensor_match.group(1))
-            repetition = int(sensor_match.group(2)) + rep_offset
+            repetition = int(sensor_match.group(2))
             collecting = sensor_found == sensor
             data_buffer = []
             continue
@@ -479,6 +526,8 @@ def split_txt_by_reps(
     # Guarda el último bloque si el archivo termina justo después de los datos.
     if collecting and data_buffer:
         save_current_block(repetition, data_buffer)
+
+    return saved_filename
 
 
 # -----------------------------------------------------------------
@@ -574,8 +623,14 @@ def main(port, wafer, chip, folder_path):
                     random_order=order,
                 )
 
-                all_info_filename = (
-                    f"All_info_{chip}_{sensor}_{sequence}_{INFO_EXTRA}.txt"
+                final_filename = build_measurement_filename(
+                    wafer=wafer,
+                    chip=chip,
+                    sensor=sensor,
+                    sequence=sequence,
+                )
+                temporary_txt_filename = build_temporary_txt_filename(
+                    final_filename
                 )
 
                 read_serial_to_file(
@@ -587,7 +642,7 @@ def main(port, wafer, chip, folder_path):
                     sensor=sensor,
                     fbwd=FBWD,
                     rep=1,
-                    output_file=all_info_filename,
+                    output_file=temporary_txt_filename,
                     timeout=MEASUREMENT_TIMEOUT_S,
                     folder_path=folder_path,
                     metadata=metadata,
@@ -595,17 +650,28 @@ def main(port, wafer, chip, folder_path):
                 )
 
                 try:
-                    split_txt_by_reps(
+                    saved_filename = split_txt_by_reps(
+                        wafer=wafer,
                         chip=chip,
                         sensor=sensor,
-                        numiter=sequence,
-                        info_extra=INFO_EXTRA,
-                        rep_offset=sequence - 1,
+                        sequence=sequence,
+                        input_filename=temporary_txt_filename,
                         folder_path=folder_path,
                         metadata=metadata,
                     )
+
+                    if saved_filename is not None:
+                        temporary_txt_path = os.path.join(
+                            folder_path,
+                            temporary_txt_filename,
+                        )
+                        os.remove(temporary_txt_path)
                 except Exception as error:
                     print(f"    [WARN] split_txt_by_reps falló: {error}")
+                    print(
+                        "    El TXT temporal se conserva para poder "
+                        f"recuperar los datos: {temporary_txt_filename}"
+                    )
 
     finally:
         serial_connection.close()
