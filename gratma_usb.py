@@ -28,6 +28,7 @@ import os
 import platform
 import struct
 import threading
+import threading
 import time
 import usb.core
 import usb.util
