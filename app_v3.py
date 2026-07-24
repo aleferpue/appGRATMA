@@ -77,29 +77,16 @@ from tkinter import (
     BOTH, DISABLED, END, INSERT, NORMAL, X, Y, BooleanVar, Canvas, Frame,
     Label, StringVar, Text, Tk, Button, filedialog, messagebox, ttk, Toplevel,
 )
-
+import numpy as np
 import usb.core as _usb_core
-# pyserial is optional: it enables the device-console backup (the GRATMA's
-# own serial terminal). Without it the app works, but that backup is off.
-try:
-    import serial as _pyserial
-    from serial.tools import list_ports as _serial_list_ports
-    _HAS_PYSERIAL = True
-except ImportError:
-    _pyserial = None
-    _serial_list_ports = None
-    _HAS_PYSERIAL = False
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.cm as _mpl_cm
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 from gratma_usb import (
-    GRATMA_PID,
-    GRATMA_VID,
     DeviceStatus,
     GratmaDeviceBusy,
-    GratmaDeviceError,
     GratmaError,
     GratmaUSB,
     RecordType,
@@ -133,6 +120,131 @@ SENSOR_COLORS = [
     "#f59f00",  # S7 yellow
     "#d6336c",  # S8 pink
 ]
+# Per-sensor drain switch maps used by the "IV - drain grounding test" mode: sensor
+# (1-based) -> (map for SW0, map for SW1), written to the MAX14662 to
+# pre-select the sensor's drain while VD settles before its sweep.
+# Default: bit N-1 on both switches. EDIT THIS TABLE if the board wiring
+# uses different maps (equivalent to DRAIN_SENSOR_MAPS in the console script).
+TESTIV_DRAIN_GND_DRAIN_SENSOR_MAPS = {s: (1 << (s - 1), 1 << (s - 1)) for s in range(1, 9)}
+# ---------------------------------------------------------------------------
+# Terminal recovery log
+# ---------------------------------------------------------------------------
+class _TeeStream:
+    """File-like object that writes both to the real terminal stream and to
+    the recovery file, flushing the file after every write so the content
+    survives a hard crash."""
+    def __init__(self, stream, fh):
+        self._stream = stream   # may be None (e.g. pythonw, no console)
+        self._fh = fh
+    def write(self, text) -> int:
+        try:
+            if self._stream is not None:
+                self._stream.write(text)
+        except Exception:
+            pass
+        try:
+            self._fh.write(text)
+            self._fh.flush()
+        except Exception:
+            pass
+        return len(text)
+    def flush(self) -> None:
+        for s in (self._stream, self._fh):
+            try:
+                if s is not None:
+                    s.flush()
+            except Exception:
+                pass
+    def isatty(self) -> bool:
+        try:
+            return bool(self._stream is not None and self._stream.isatty())
+        except Exception:
+            return False
+
+
+class TerminalRecorder:
+    """Saves EVERYTHING that appears in the terminal into a .txt file, as a
+    last-resort backup of the measurement data: if the app fails while the
+    GRATMA keeps measuring, the points already received (printed as DATA
+    lines) can be recovered from this file. Every line is flushed to disk
+    immediately.
+
+    The file is deleted automatically on exit when the process finished
+    correctly: no unhandled errors, no measurement left running/aborted,
+    and the last measurement exported to CSV. Otherwise it is kept."""
+
+    def __init__(self) -> None:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        folder = os.path.dirname(os.path.abspath(__file__))
+        # PID in the name: two app instances never collide on the same file.
+        self.path = os.path.join(folder, f"gratma_terminal_{ts}_p{os.getpid()}.txt")
+        self._fh = open(self.path, "w", encoding="utf-8")
+        self._keep = False          # an error happened somewhere
+        self._meas_running = False  # a measurement is in progress / was aborted
+        self._unsaved = False       # last finished measurement not exported yet
+        # Tee stdout/stderr: everything printed reaches terminal AND file.
+        sys.stdout = _TeeStream(sys.__stdout__, self._fh)
+        sys.stderr = _TeeStream(sys.__stderr__, self._fh)
+        # Uncaught exceptions (main thread and worker threads) must also
+        # land in the file before the process dies.
+        sys.excepthook = self._excepthook
+        threading.excepthook = self._thread_excepthook
+        print(f"=== GRATMA terminal log started {datetime.now():%Y-%m-%d %H:%M:%S} ===")
+        print(f"=== Recovery file: {self.path} ===")
+        print("=== DATA line format: DATA type=<1 sweep|3 idt> sensor=Sn rep=k "
+              "fwd|bwd seq=<point|ms> v1 v2 v3 v4 "
+              "(sweep: Vg[V] Is[A] Vs[V] Ig[A] — idt: Vsbus[V] Is[A] Vg[V] Ig[A]) ===")
+
+    # -- exception hooks ----------------------------------------------------
+    def _excepthook(self, exc_type, exc, tb) -> None:
+        self._keep = True
+        traceback.print_exception(exc_type, exc, tb)
+
+    def _thread_excepthook(self, args) -> None:
+        self._keep = True
+        name = getattr(args.thread, "name", "?") if args.thread else "?"
+        print(f"--- Unhandled exception in thread {name!r} ---")
+        traceback.print_exception(args.exc_type, args.exc_value, args.exc_traceback)
+
+    # -- state notifications (called by the app) -----------------------------
+    def meas_started(self) -> None:
+        self._meas_running = True
+
+    def meas_done(self, saved: bool = False) -> None:
+        """A measurement produced its final result. If it is not exported
+        to CSV yet, the recovery file stays 'needed' until export_ok()."""
+        self._meas_running = False
+        self._unsaved = not saved
+
+    def export_ok(self) -> None:
+        self._unsaved = False
+
+    def keep(self, reason: str = "") -> None:
+        self._keep = True
+        if reason:
+            print(f"--- Terminal log will be kept: {reason} ---")
+
+    # -- shutdown -------------------------------------------------------------
+    def close(self) -> None:
+        """Restores the real streams and deletes the file on a clean finish."""
+        keep = self._keep or self._meas_running or self._unsaved
+        reason = ("error detected" if self._keep else
+                  "measurement running or aborted" if self._meas_running else
+                  "measurement not exported to CSV" if self._unsaved else "")
+        print(f"=== GRATMA terminal log closed {datetime.now():%Y-%m-%d %H:%M:%S} — "
+              + (f"KEEPING {os.path.basename(self.path)} ({reason})" if keep
+                 else "clean finish, deleting recovery file") + " ===")
+        sys.stdout = sys.__stdout__
+        sys.stderr = sys.__stderr__
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+        if not keep:
+            try:
+                os.remove(self.path)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +253,8 @@ SENSOR_COLORS = [
 class GratmaApp:
     def __init__(self, root: Tk, recorder: 'TerminalRecorder | None' = None) -> None:
         self.root = root
-        self.root.title("GRATMA v2.0.0 — Control & Measurement")
+        self._recorder = recorder
+        self.root.title("GRATMA v3.3.0 — Control & Measurement")
         self.root.configure(bg=BG)
         self.root.minsize(1100, 750)
         self._dev: GratmaUSB | None = None
@@ -153,6 +266,10 @@ class GratmaApp:
         self._diff_records_phase1: list[dict] = []
         self._diff_records_phase2: list[dict] = []
         self._last_meas_data: dict | None = None  # Last completed measurement (for export)
+        self._last_export_files: list[str] = []  # CSVs written by the last export (for Data Analysis)
+        self._da_curves: list[tuple] = []  # loaded (v_fwd, i_fwd, v_bwd, i_bwd) tuples
+        self._da_curve_sensors: list[int] = []  # 1-based sensor of each loaded curve
+        self._da_files: list[str] = []
         self._continuous_job: str | None = None
         self._ping_job: str | None = None
         self._ping_active = False
@@ -166,7 +283,6 @@ class GratmaApp:
         # line exactly where the sweep switches forward <-> backward.
         self._rt_series: dict[tuple[int, int], list[tuple[float, float, bool]]] = {}
         self._rt_kind = "iv"  # iv | idt | differential | manual
-
         self._apply_style()
         self._build_ui()
         self._update_conn_state(connected=False)
@@ -517,7 +633,7 @@ class GratmaApp:
         self._iv_vg_end = self._entry_row(self._params_iv_param, "VG end (mV):", 1200, 2)
         self._iv_vg_step = self._entry_row(self._params_iv_param, "VG step (mV):", 50, 3)
         self._iv_reps = self._entry_row(self._params_iv_param, "Repetitions:", 1, 4)
-        self._iv_reverse = BooleanVar(value=True)  # Reverse sweep ON by default
+        self._iv_reverse = BooleanVar(value=False)
         ttk.Checkbutton(self._params_iv_param, text="Reverse sweep",
                         variable=self._iv_reverse).grid(
             row=5, column=0, columnspan=2, sticky="w", pady=(6, 2))
@@ -731,7 +847,376 @@ class GratmaApp:
         self._instr_ts_lbl = Label(right, text="", bg=BG, fg=FG_DIM,
                                    font=("Segoe UI", 8))
         self._instr_ts_lbl.pack(anchor="w", pady=(8, 0))
-
+    # -----------------------------------------------------------------------
+    # Tab 4: Data Analysis
+    # -----------------------------------------------------------------------
+    def _build_tab_data_analysis(self) -> None:
+        tab = Frame(self._nb, bg=BG)
+        self._nb.add(tab, text="  Data Analysis  ")
+        # Left panel: controls
+        left = Frame(tab, bg=BG, width=300)
+        left.pack(side="left", fill=Y, padx=(PAD, 0), pady=PAD)
+        left.pack_propagate(False)
+        src_frame = ttk.LabelFrame(left, text="Data Source", padding=12)
+        src_frame.pack(fill=X, pady=(0, 8))
+        self._btn_da_last = Button(
+            src_frame, text="Represent last measurements",
+            command=self._on_da_represent_last,
+            bg=ACCENT, fg=BG, relief="flat",
+            activebackground=FG, activeforeground=BG,
+            font=("Segoe UI", 9, "bold"))
+        self._btn_da_last.pack(fill=X, pady=(0, 6))
+        self._btn_da_select = Button(
+            src_frame, text="Select files…",
+            command=self._on_da_select_files,
+            bg=BG2, fg=FG, relief="flat",
+            activebackground=BG, activeforeground=FG,
+            font=("Segoe UI", 9))
+        self._btn_da_select.pack(fill=X)
+        # Sensors to represent: all selected by default; unticking a sensor
+        # excludes its curves from every plot of this tab.
+        sens_frame = ttk.LabelFrame(left, text="Sensors to represent", padding=8)
+        sens_frame.pack(fill=X, pady=(8, 0))
+        self._da_sensor_vars: list[BooleanVar] = []
+        for i in range(8):
+            var = BooleanVar(value=True)
+            self._da_sensor_vars.append(var)
+            ttk.Checkbutton(sens_frame, text=f"S{i + 1}", variable=var,
+                            command=self._da_render).grid(
+                row=i // 4, column=i % 4, sticky="w", padx=4, pady=2)
+        self._da_info = StringVar(value="No data loaded")
+        Label(left, textvariable=self._da_info, bg=BG, fg=YELLOW,
+              font=("Consolas", 9), justify="left", anchor="w",
+              wraplength=280).pack(fill=X, pady=(4, 8))
+        plot_frame = ttk.LabelFrame(left, text="Plot", padding=12)
+        plot_frame.pack(fill=X, pady=(0, 8))
+        self._da_plot_kind = StringVar(value="Forward curves")
+        for lbl in ["Forward curves", "Backward curves",
+                    "Mean ± std", "Dirac violin"]:
+            ttk.Radiobutton(plot_frame, text=lbl, variable=self._da_plot_kind,
+                            value=lbl, command=self._da_render).pack(anchor="w", pady=2)
+        Label(left,
+              text="Each file is treated as one sensor: the first half of the\n"
+                   "rows is the forward sweep and the second half the backward\n"
+                   "sweep. Currents are shown in µA. Axes auto-scale to the data.",
+              bg=BG, fg=FG_DIM, font=("Segoe UI", 7, "italic"),
+              justify="left").pack(anchor="w", pady=(4, 0))
+        self._btn_da_save = Button(
+            left, text="Save current plot (PNG)…", command=self._on_da_save_plot,
+            bg=BG2, fg=FG, relief="flat", font=("Segoe UI", 9))
+        self._btn_da_save.pack(fill=X, pady=(10, 0))
+        self._btn_da_save_all = Button(
+            left, text="Save all PNG", command=self._on_da_save_all,
+            bg=BG2, fg=FG, relief="flat", font=("Segoe UI", 9))
+        self._btn_da_save_all.pack(fill=X, pady=(6, 0))
+        # Right panel: embedded figure
+        right = Frame(tab, bg=BG)
+        right.pack(side="left", fill=BOTH, expand=True, padx=PAD, pady=PAD)
+        Label(right, text="Analysis", bg=BG, fg=ACCENT,
+              font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 4))
+        self._da_fig = Figure(facecolor="white", figsize=(7, 5))
+        self._da_canvas = FigureCanvasTkAgg(self._da_fig, master=right)
+        self._da_canvas.get_tk_widget().pack(fill=BOTH, expand=True)
+        tb = NavigationToolbar2Tk(self._da_canvas, right, pack_toolbar=False)
+        tb.update()
+        tb.pack(fill=X)
+        self._style_toolbar(tb)
+        self._da_render()
+    # -- Data Analysis: file loading -----------------------------------------
+    def _on_da_represent_last(self) -> None:
+        files = self._last_export_files
+        if not files:
+            messagebox.showinfo(
+                "Data Analysis",
+                "No measurements have been exported yet in this session.\n\n"
+                "Run a measurement (with an output folder, or use 'Export CSV') "
+                "and then try again — or use 'Select files…'.")
+            return
+        self._da_load_files(list(files))
+    def _on_da_select_files(self) -> None:
+        paths = filedialog.askopenfilenames(
+            title="Select measurement files",
+            filetypes=[("Measurement data", "*.csv *.txt"), ("All files", "*.*")])
+        if paths:
+            self._da_load_files(list(paths))
+    def _da_load_files(self, paths: list[str]) -> None:
+        curves: list[tuple] = []
+        sensors: list[int] = []
+        skipped = 0
+        for p in paths:
+            try:
+                v, i_a = self._da_read_curve(p)
+            except Exception as e:
+                skipped += 1
+                self._log_write(f"DA: error reading {os.path.basename(p)}: {e}", RED)
+                continue
+            if v.size < 2:
+                skipped += 1
+                continue
+            i_ua = i_a * 1e6  # A → µA
+            mid = v.size // 2
+            if mid == 0:
+                skipped += 1
+                continue
+            curves.append((v[:mid], i_ua[:mid], v[mid:], i_ua[mid:]))
+            sensors.append(self._da_sensor_from_filename(p, fallback=len(curves)))
+        self._da_curves = curves
+        self._da_curve_sensors = sensors
+        self._da_files = paths
+        msg = f"{len(curves)} curve(s) loaded"
+        if skipped:
+            msg += f"  ({skipped} skipped)"
+        self._da_info.set(msg)
+        self._log_write(f"Data Analysis: {msg}", GREEN if curves else ORANGE)
+        self._da_render()
+    @staticmethod
+    def _da_read_curve(path: str):
+        """Reads a curve as (Vg, Id) numpy arrays (Id in Amperes).
+        Handles the app's own CSV export (metadata block followed by a
+        'VG_V,IS_A,...' header and comma-separated rows) as well as generic
+        two-column text files (whitespace- or comma-separated, with either
+        '.' or ',' as the decimal separator)."""
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+        # Locate the app-CSV data header, if present.
+        hdr_idx = None
+        for idx, line in enumerate(lines):
+            if line.strip().lower().replace(" ", "").startswith("vg_v,"):
+                hdr_idx = idx
+                break
+        vg: list[float] = []
+        ids: list[float] = []
+        if hdr_idx is not None:
+            for line in lines[hdr_idx + 1:]:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(",")
+                if len(parts) < 2:
+                    continue
+                try:
+                    x, y = float(parts[0]), float(parts[1])
+                except ValueError:
+                    continue
+                vg.append(x)
+                ids.append(y)
+        else:
+            for line in lines:
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    continue
+                # Prefer whitespace-separated columns (like the lab's instrument
+                # files, which may use a comma as the decimal separator); fall
+                # back to a comma-separated table with dot decimals.
+                parts = s.replace(",", ".").split()
+                if len(parts) < 2:
+                    parts = s.split(",")
+                if len(parts) < 2:
+                    continue
+                try:
+                    x, y = float(parts[0]), float(parts[1])
+                except ValueError:
+                    continue
+                vg.append(x)
+                ids.append(y)
+        return np.asarray(vg, dtype=float), np.asarray(ids, dtype=float)
+    @staticmethod
+    def _da_sensor_from_filename(path: str, fallback: int) -> int:
+        """Guesses the 1-based sensor number of a data file from the app's
+        export naming <sample>_<sensor>_<type>_<rep>_<extra>.csv (the sensor
+        token is e.g. '3' or 'S3'). For files that do not follow the pattern,
+        returns 'fallback' (the loading order), wrapped to 1..8."""
+        name = os.path.splitext(os.path.basename(path))[0]
+        for tok in name.split("_")[1:]:
+            t = tok.upper().lstrip("S")
+            if t.isdigit():
+                n = int(t)
+                if 1 <= n <= 8:
+                    return n
+                break  # first numeric token is the sensor slot; give up if out of range
+        return ((fallback - 1) % 8) + 1
+    # -- Data Analysis: plotting ---------------------------------------------
+    @staticmethod
+    def _da_cmap(n: int):
+        """Returns a callable colormap with n distinct colors (tab10)."""
+        n = max(1, n)
+        try:
+            return matplotlib.colormaps["tab10"].resampled(n)
+        except Exception:  # older matplotlib
+            return _mpl_cm.get_cmap("tab10", n)
+    @staticmethod
+    def _da_format_axes(ax, xlabel: str, ylabel: str) -> None:
+        """Publication styling: inward ticks on all four sides, bold tick
+        labels, bold axis titles and a thick frame."""
+        ax.xaxis.set_ticks_position("both")
+        ax.yaxis.set_ticks_position("both")
+        ax.tick_params(axis="both", which="both", direction="in",
+                       top=True, bottom=True, left=True, right=True,
+                       length=6, width=1.5, labelsize=12)
+        for side in ("bottom", "top", "left", "right"):
+            ax.spines[side].set_visible(True)
+            ax.spines[side].set_linewidth(1.8)
+        for label in ax.get_xticklabels() + ax.get_yticklabels():
+            label.set_fontweight("bold")
+        ax.set_xlabel(xlabel, fontsize=14, fontweight="bold", labelpad=8)
+        ax.set_ylabel(ylabel, fontsize=14, fontweight="bold", labelpad=8)
+    def _da_render(self) -> None:
+        """Draws the currently-selected analysis plot from the loaded curves."""
+        kind = self._da_plot_kind.get()
+        fig = self._da_fig
+        fig.clear()
+        ax = fig.add_subplot(111)
+        ax.set_facecolor("white")
+        # Keep only the curves whose sensor is ticked in "Sensors to represent".
+        selected = {i + 1 for i, v in enumerate(self._da_sensor_vars) if v.get()}
+        curves = [c for c, s in zip(self._da_curves, self._da_curve_sensors)
+                  if s in selected]
+        xlabel = "Gate Voltage (V)"
+        ylabel = "Drain Current (µA)"
+        if not curves:
+            empty_msg = ("No data loaded.\nUse the buttons on the left."
+                         if not self._da_curves else
+                         "All sensors are deselected.\n"
+                         "Tick at least one in 'Sensors to represent'.")
+            ax.text(0.5, 0.5, empty_msg,
+                    ha="center", va="center", fontsize=13, color="#555555",
+                    transform=ax.transAxes)
+            ax.set_xticks([]); ax.set_yticks([])
+            fig.tight_layout()
+            self._da_canvas.draw()
+            return
+        n = len(curves)
+        cmap = self._da_cmap(n)
+        if kind in ("Forward curves", "Backward curves"):
+            forward = (kind == "Forward curves")
+            for idx, (vf, if_, vb, ib) in enumerate(curves):
+                v = vf if forward else vb
+                i = if_ if forward else ib
+                ax.plot(v, i, color=cmap(idx % 10))
+            ax.set_title(f"{'Forward' if forward else 'Backward'} curves "
+                         f"({n} sensors)", fontsize=13)
+            self._da_format_axes(ax, xlabel, ylabel)
+        elif kind == "Mean ± std":
+            all_v = np.concatenate([np.concatenate([vf, vb])
+                                    for vf, if_, vb, ib in curves])
+            x_lo, x_hi = float(np.min(all_v)), float(np.max(all_v))
+            common_x = np.linspace(x_lo, x_hi, 300)
+            def interp(vs, is_):
+                order = np.argsort(vs)
+                return np.interp(common_x, np.asarray(vs)[order], np.asarray(is_)[order])
+            fwd = np.array([interp(vf, if_) for vf, if_, vb, ib in curves])
+            bwd = np.array([interp(vb, ib) for vf, if_, vb, ib in curves])
+            mean_f, std_f = fwd.mean(axis=0), fwd.std(axis=0)
+            mean_b, std_b = bwd.mean(axis=0), bwd.std(axis=0)
+            ax.plot(common_x, mean_f, color="blue", label="Mean Forward")
+            ax.fill_between(common_x, mean_f - std_f, mean_f + std_f,
+                            color="blue", alpha=0.3)
+            ax.plot(common_x, mean_b, color="red", label="Mean Backward")
+            ax.fill_between(common_x, mean_b - std_b, mean_b + std_b,
+                            color="red", alpha=0.3)
+            ax.set_title(f"Mean curve with std ({n} sensors)", fontsize=13)
+            self._da_format_axes(ax, xlabel, ylabel)
+            leg = ax.legend(fontsize=12, frameon=False)
+            for text in leg.get_texts():
+                text.set_fontweight("bold")
+        elif kind == "Dirac violin":
+            dirac_f, dirac_b = [], []
+            for vf, if_, vb, ib in curves:
+                if if_.size:
+                    dirac_f.append(float(vf[np.argmin(if_)]))
+                if ib.size:
+                    dirac_b.append(float(vb[np.argmin(ib)]))
+            data = [dirac_b, dirac_f]
+            labels = ["Backward", "Forward"]
+            colors = ["red", "blue"]
+            if any(len(d) for d in data):
+                nonempty = [(pos, d, colors[pos - 1])
+                            for pos, d in enumerate(data, start=1) if len(d)]
+                parts = ax.violinplot([d for _, d, _ in nonempty],
+                                      positions=[p for p, _, _ in nonempty],
+                                      vert=False, showmeans=False,
+                                      showextrema=False, showmedians=False)
+                for body, (_, _, c) in zip(parts["bodies"], nonempty):
+                    body.set_facecolor(c)
+                    body.set_edgecolor(c)
+                    body.set_alpha(0.3)
+                for pos, d, c in nonempty:
+                    med = float(np.median(d))
+                    ax.plot([med, med], [pos - 0.3, pos + 0.3], color=c, linewidth=2)
+                    y_jit = np.random.normal(pos, 0.04, size=len(d))
+                    ax.scatter(d, y_jit, color=c, alpha=0.9)
+            ax.set_yticks([1, 2])
+            ax.set_yticklabels(labels, fontsize=13, fontweight="bold")
+            ax.set_xlabel(r"$\mathbf{V}_{\mathbf{Dirac}}\ \mathbf{(V)}$", fontsize=14)
+            ax.set_title(f"Dirac point distribution ({n} sensors)", fontsize=13)
+            ax.tick_params(direction="in", length=6, width=1.5, which="both",
+                           top=True, bottom=True, left=True, right=True)
+            for tick in ax.get_xticklabels():
+                tick.set_fontweight("bold")
+            for spine in ax.spines.values():
+                spine.set_linewidth(2.2)
+        fig.tight_layout()
+        self._da_canvas.draw()
+    def _on_da_save_plot(self) -> None:
+        if not self._da_curves:
+            messagebox.showinfo("Data Analysis", "There is no plot to save yet.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save plot", defaultextension=".png",
+            filetypes=[("PNG image", "*.png"), ("PDF", "*.pdf"), ("SVG", "*.svg")])
+        if not path:
+            return
+        try:
+            self._da_fig.savefig(path, dpi=300, facecolor="white", bbox_inches="tight")
+            self._log_write(f"Plot saved: {os.path.basename(path)}", GREEN)
+        except Exception as e:
+            self._log_write(f"Error saving plot: {e}", RED)
+    # File-name suffix for each plot type when using "Save all PNG".
+    _DA_SAVE_ALL_SUFFIXES = {
+        "Forward curves": "Forward curves",
+        "Backward curves": "Reverse curves",
+        "Mean ± std": "Mean std",
+        "Dirac violin": "Dirac violin",
+    }
+    def _on_da_save_all(self) -> None:
+        """Saves the four available plots as PNG in the folder of the loaded
+        data files, automatically named as <data name>_<plot type>.png
+        (Forward curves, Reverse curves, Mean std, Dirac violin). The
+        'Sensors to represent' selection is honoured."""
+        if not self._da_curves:
+            messagebox.showinfo("Data Analysis", "There is no data loaded yet.")
+            return
+        # Base name = common prefix of the loaded data file names (i.e. the
+        # name the data was saved with); folder = where those files live.
+        names = [os.path.splitext(os.path.basename(p))[0] for p in self._da_files]
+        base = os.path.commonprefix(names).rstrip("_- ") if names else ""
+        if not base:
+            base = names[0] if names else "analysis"
+        folder = os.path.dirname(self._da_files[0]) if self._da_files else ""
+        if not folder or not os.path.isdir(folder):
+            folder = filedialog.askdirectory(title="Folder for the PNG files")
+            if not folder:
+                return
+        current_kind = self._da_plot_kind.get()
+        written: list[str] = []
+        try:
+            for kind, suffix in self._DA_SAVE_ALL_SUFFIXES.items():
+                self._da_plot_kind.set(kind)
+                self._da_render()
+                path = os.path.join(folder, f"{base}_{suffix}.png")
+                self._da_fig.savefig(path, dpi=300, facecolor="white",
+                                     bbox_inches="tight")
+                written.append(path)
+        except Exception as e:
+            self._log_write(f"Error in Save all PNG: {e}", RED)
+        finally:
+            # Restore the plot the user was looking at.
+            self._da_plot_kind.set(current_kind)
+            self._da_render()
+        if written:
+            self._log_write(f"Save all PNG: {len(written)} files in {folder}", GREEN)
+            for p in written:
+                self._log_write(f"  → {os.path.basename(p)}", FG_DIM)
     # -----------------------------------------------------------------------
     # Log Panel
     # -----------------------------------------------------------------------
@@ -913,10 +1398,6 @@ class GratmaApp:
                     f"Error USB (errno={errno}): {e}\n"
                     "  → Reconnect device if persists."))
                 self._rq.put(("busy_off", None))
-                # The device may still be measuring: keep the recovery file
-                # (it also holds the CONSOLE| lines from the device terminal).
-                if self._recorder:
-                    self._recorder.keep(f"USB error (errno={errno}) during operation")
             except Exception as e:
                 self._rq.put(("log_error", f"{type(e).__name__}: {e}"))
                 self._rq.put(("busy_off", None))
@@ -945,8 +1426,6 @@ class GratmaApp:
             case "connected":
                 self._update_conn_state(True)
                 self._log_write("GRATMA device connected", GREEN)
-                # Start the device-console backup (best-effort, in background)
-                self._start_console_backup()
                 # Update device info
                 if data:
                     self._info_device.set("GRATMA")
@@ -954,7 +1433,6 @@ class GratmaApp:
                     self._info_fw.set(f"0x{data['bcdDevice']:04X}")
                     self._info_serial.set(data['serial'] or "N/A")
             case "disconnected":
-                self._console.stop()
                 self._instr_continuous.set(False)
                 if self._continuous_job:
                     self.root.after_cancel(self._continuous_job)
@@ -986,7 +1464,6 @@ class GratmaApp:
                 self._on_measurement_complete(data)
             case "meas_update":
                 self._on_measurement_update(data)
-
     # -----------------------------------------------------------------------
     # Handlers de eventos
     # -----------------------------------------------------------------------
@@ -1035,7 +1512,6 @@ class GratmaApp:
         self._dev.ping()
         self._rq.put(("log_ok", "Manual Ping OK — device responds"))
         self._rq.put(("busy_off", None))
-
     # --  Measurements -----------------------------------------------------------
     def _on_start_measurement(self) -> None:
         meas_type = self._meas_type.get()
@@ -1047,8 +1523,6 @@ class GratmaApp:
             "iv_randomised": "iv", "IV_drain_grounding": "iv",
         }[meas_type]
         self._rt_series = {}
-        self._rt_progress = ""
-        self._rt_progress_worker = False
         self._render_meas_plot(final=False)
         # Capture identification/sensors for CSV saving
         sensors_list = self._selected_sensors()
@@ -1173,7 +1647,10 @@ class GratmaApp:
             return
         self._abort_measurement = True
         self._log_write("⚠ STOP requested - aborting measurement...", ORANGE)
-
+        # An aborted measurement is never exported: keep the terminal file
+        # so its partial points can be recovered if needed.
+        if self._recorder:
+            self._recorder.keep("measurement aborted by user")
     def _stream_records(self, update_type: str, point_type: int, end_type: int,
                         phase: int | None = None, poll_s: float = 0.3) -> list[dict] | None:
         """
@@ -1185,8 +1662,8 @@ class GratmaApp:
         all_records: list[dict] = []
         def drain_pending() -> bool:
             found_end = False
-            while self._usb_call(self._dev.get_data_count) > 0:
-                batch = self._usb_call(self._dev.get_data, 4)
+            while self._dev.get_data_count() > 0:
+                batch = self._dev.get_data(4)
                 all_records.extend(batch)
                 # Print every record to the terminal as soon as it arrives:
                 # this is the raw material of the recovery .txt file, and it
@@ -1219,14 +1696,45 @@ class GratmaApp:
                 return None
             if drain_pending():
                 return all_records
-            status = self._usb_call(self._dev.get_status)
+            status = self._dev.get_status()
             if status == DeviceStatus.ERROR:
                 raise GratmaError("Device entered ERROR status during measurement")
             if status == DeviceStatus.IDLE:
                 drain_pending()
                 return all_records
             time.sleep(poll_s)
-
+    # -- VG-end reachability helpers ------------------------------------------
+    @staticmethod
+    def _vg_end_residual(vg_start: int, vg_end: int, vg_step: int) -> int:
+        """Returns the length (mV) of the shortened final step needed to land
+        exactly on VG end, or 0 when the range is an exact multiple of the
+        step (e.g. start=0, end=1200, step=200 → 0; but from 1100 with
+        step=200 the last step must be only 100 mV)."""
+        if vg_step <= 0:
+            return 0
+        return abs(vg_end - vg_start) % vg_step
+    def _log_vg_end_note(self, vg_start: int, vg_end: int, vg_step: int) -> None:
+        """Logs how the sweep will land on VG end when the step does not
+        divide the range exactly (the firmware clamps the final step)."""
+        residual = self._vg_end_residual(vg_start, vg_end, vg_step)
+        if residual:
+            self._log_write(
+                f"VG range not a multiple of the step: the final step is "
+                f"shortened to {residual} mV so the sweep still measures "
+                f"exactly at VG end = {vg_end} mV.", ORANGE)
+    def _check_vg_end_reached(self, pts: list[dict], vg_end: int,
+                              label: str = "") -> None:
+        """After a sweep, verifies that the maximum VG actually measured
+        reached VG end (within 1 mV) and warns in the log if it did not —
+        which would mean the firmware is missing the final-step clamp."""
+        if not pts:
+            return
+        vg_max_mv = max(p["v1"] for p in pts) * 1000.0
+        if vg_max_mv < vg_end - 1.0:
+            self._log_write(
+                f"⚠ {label}last VG measured = {vg_max_mv:.0f} mV but "
+                f"VG end = {vg_end} mV — update the firmware with the "
+                f"final-step clamp so the sweep reaches VG end.", ORANGE)
     def _meas_iv_param_worker(self, vs, vg_start, vg_end, vg_step, mask, reverse, reps, parallel) -> None:
         mode = "parallel" if parallel else "sequential"
         self._log_write(
@@ -1249,6 +1757,7 @@ class GratmaApp:
         except Exception:
             pass
         pts = [r for r in records if r["type"] == RecordType.SWEEP_POINT]
+        self._check_vg_end_reached(pts, vg_end)
         meta = {
             "timestamp": timestamp, "vs_mv": vs, "vg_start_mv": vg_start,
             "vg_end_mv": vg_end, "vg_step_mv": vg_step, "reps": reps,
@@ -1388,7 +1897,354 @@ class GratmaApp:
                 "meta1": meta1,
                 "meta2": meta2,
             }))
-
+    # -- Randomised I-V ------------------------------------------------------
+    def _sleep_abortable(self, seconds: float) -> bool:
+        """Sleeps in small slices, returning False as soon as STOP is pressed."""
+        deadline = time.monotonic() + max(0.0, seconds)
+        while time.monotonic() < deadline:
+            if self._abort_measurement:
+                return False
+            time.sleep(min(0.2, deadline - time.monotonic()))
+        return not self._abort_measurement
+    def _wait_device_idle(self, timeout: float = 15.0) -> bool:
+        """Waits until the device reports IDLE before starting the next sweep.
+        Prevents a 'device busy' error when firing single-sensor sweeps
+        back to back. Returns False only if the user aborts."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._abort_measurement:
+                return False
+            try:
+                st = self._dev.get_status()
+            except Exception:
+                st = None
+            if st == DeviceStatus.IDLE:
+                return True
+            if st == DeviceStatus.ERROR:
+                raise GratmaError("Device in ERROR status before sweep")
+            time.sleep(0.1)
+        return True  # proceed anyway after the timeout
+    def _wait_sweeping(self, timeout: float = 3.0) -> None:
+        """After starting a sweep, waits until the device has actually left
+        IDLE (status SWEEPING or first data available). Without this a fast
+        back-to-back loop can read the *previous* IDLE state and think the
+        sweep already finished with no points."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._abort_measurement:
+                return
+            try:
+                if self._dev.get_data_count() > 0:
+                    return
+                st = self._dev.get_status()
+            except Exception:
+                return
+            if st in (DeviceStatus.SWEEPING, DeviceStatus.ERROR):
+                return
+            time.sleep(0.05)
+    @staticmethod
+    def _random_sequence_order(sensors_list: list[int]) -> list[int]:
+        """Builds a randomised measurement order that alternates between the
+        top group (sensors 1-4) and the bottom group (5-8). Within each group
+        the pick is random; groups alternate top→bottom→top… until every
+        selected sensor has been placed. Extra sensors in the larger group are
+        appended once the other group is exhausted."""
+        top = [s for s in sensors_list if s <= 4]
+        bottom = [s for s in sensors_list if s >= 5]
+        random.shuffle(top)
+        random.shuffle(bottom)
+        order: list[int] = []
+        ti = bi = 0
+        take_top = True
+        while ti < len(top) or bi < len(bottom):
+            if take_top and ti < len(top):
+                order.append(top[ti]); ti += 1
+            elif (not take_top) and bi < len(bottom):
+                order.append(bottom[bi]); bi += 1
+            elif ti < len(top):
+                order.append(top[ti]); ti += 1
+            elif bi < len(bottom):
+                order.append(bottom[bi]); bi += 1
+            take_top = not take_top
+        return order
+    def _meas_iv_random_worker(self, vs, vg_start, vg_end, vg_step, sensors_list,
+                               reverse, stab_s, settle_s, discard, reps, random_mode,
+                               gnd_unselected) -> None:
+        total_seq = discard + reps
+        self._log_write(
+            f"I-V Randomised: VS(Vd)={vs}mV  VG={vg_start}→{vg_end}mV  step={vg_step}mV  "
+            f"sensors={sensors_list}  discard={discard}  keep(reps)={reps}  "
+            f"→ {total_seq} sequences  random={'on' if random_mode else 'off'}  "
+            f"GND-unselected={'on' if gnd_unselected else 'off'}", CYAN)
+        self._log_vg_end_note(vg_start, vg_end, vg_step)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # 1. Connect all channels and set everything to 0 V.
+        self._log_write("Connecting all channels (SW0/SW1 = 0xFF) and setting 0 V ...", FG_DIM)
+        self._dev.set_switch(sw=0, sw_map=0xFF)
+        self._dev.set_switch(sw=1, sw_map=0xFF)
+        self._dev.set_voltage(dac=0, out=0, mv=0)  # VG = 0 V
+        self._dev.set_voltage(dac=1, out=0, mv=0)  # VS / drain = 0 V
+        # 1b. Tell the firmware what to do with the NON-selected sources on
+        #     every sensor change (USB_VENDOR_CMD_SET_UNSEL_MODE, 0x14):
+        #     GND (grounded) when the checkbox is ticked, OPEN otherwise.
+        try:
+            self._dev.set_unsel_mode(UnselMode.GND if gnd_unselected
+                                     else UnselMode.OPEN)
+            self._log_write(
+                "Unselected-source mode: "
+                + ("GND — non-measured sources tied to ground"
+                   if gnd_unselected else "OPEN — classic behaviour"), CYAN)
+        except GratmaError as e:
+            if gnd_unselected:
+                self._log_write(
+                    f"⚠ Firmware does not support SET_UNSEL_MODE (0x14): {e} — "
+                    "continuing with the classic (open) behaviour", ORANGE)
+                gnd_unselected = False
+        # 2. Stabilization wait.
+        self._log_write(f"Stabilizing for {stab_s / 60.0:.2f} min ...", ORANGE)
+        if not self._sleep_abortable(stab_s):
+            self._rq.put(("log_warn", "Random I-V aborted during stabilization"))
+            self._rq.put(("busy_off", None))
+            return
+        # 3. Switch the drain to Vd and let it settle.
+        self._log_write(f"Setting drain to {vs} mV and settling {settle_s:.0f} s ...", FG_DIM)
+        self._dev.set_voltage(dac=1, out=0, mv=vs)
+        if not self._sleep_abortable(settle_s):
+            self._rq.put(("log_warn", "Random I-V aborted during drain settle"))
+            self._rq.put(("busy_off", None))
+            return
+        # 4-6. Run (discard + reps) sequences. The first 'discard' sequences are
+        # thrown away; the remaining 'reps' are kept and renumbered rep 1..reps.
+        kept: list[dict] = []
+        for seq in range(1, total_seq + 1):
+            if self._abort_measurement:
+                self._rq.put(("log_warn", "Random I-V aborted by user"))
+                self._rq.put(("busy_off", None))
+                return
+            order = (self._random_sequence_order(sensors_list)
+                     if random_mode else list(sensors_list))
+            is_discard = (seq <= discard)
+            kept_rep = seq - discard  # 1..reps for the sequences we keep
+            tag = "discarded" if is_discard else f"kept as rep {kept_rep}"
+            self._log_write(
+                f"── Sequence {seq}/{total_seq} ({tag}) — order {order} ──", MAGENTA)
+            for sensor in order:
+                if self._abort_measurement:
+                    self._rq.put(("log_warn", "Random I-V aborted by user"))
+                    self._rq.put(("busy_off", None))
+                    return
+                mask = self._sensor_mask([sensor])
+                # Make sure the previous sweep has fully finished before we
+                # start the next one (otherwise the device reports busy or the
+                # stream reads a stale IDLE and returns no points).
+                if not self._wait_device_idle():
+                    self._rq.put(("log_warn", "Random I-V aborted by user"))
+                    self._rq.put(("busy_off", None))
+                    return
+                if gnd_unselected:
+                    # Report which sources the firmware is grounding while
+                    # this sensor is measured, and the drain voltage actually
+                    # applied to the measured one (INA228[0] = VS bus).
+                    grounded = [s for s in range(1, 9) if s != sensor]
+                    self._log_write(
+                        f"  S{sensor} selected → sources to GND: "
+                        + ", ".join(f"S{g}" for g in grounded), CYAN)
+                    try:
+                        vbus = self._dev.get_vbus(0)
+                        self._log_write(
+                            f"  S{sensor} drain voltage (VS bus): {vbus:.4f} V", CYAN)
+                    except Exception as e:
+                        self._log_write(
+                            f"  Could not read the VS bus voltage: {e}", ORANGE)
+                self._log_write(f"  Sweeping S{sensor} ...", FG_DIM)
+                self._dev.start_sweep_ex(
+                    vs_mv=vs, vg_start_mv=vg_start, vg_end_mv=vg_end,
+                    vg_step_mv=vg_step, sensors=mask,
+                    reverse=reverse, repetitions=1, parallel=False)
+                # Wait for the sweep to actually start before streaming.
+                self._wait_sweeping()
+                records = self._stream_records("iv", RecordType.SWEEP_POINT,
+                                               RecordType.SWEEP_END)
+                if records is None:
+                    self._rq.put(("log_warn", "Random I-V aborted by user"))
+                    self._rq.put(("busy_off", None))
+                    return
+                pts = [r for r in records if r["type"] == RecordType.SWEEP_POINT]
+                # We drive one sensor per sweep, so tag records explicitly with
+                # the sensor we selected and the repetition index.
+                for r in pts:
+                    r["sensor"] = sensor
+                    r["rep"] = kept_rep
+                self._check_vg_end_reached(pts, vg_end, label=f"S{sensor}: ")
+                self._log_write(
+                    f"    S{sensor}: {len(pts)} points"
+                    + ("  (discarded)" if is_discard else ""),
+                    FG_DIM if is_discard else GREEN)
+                if not is_discard:
+                    kept.extend(pts)
+        # Leave the firmware back in the classic (open) mode so the setting
+        # does not silently affect the other measurement types.
+        if gnd_unselected:
+            try:
+                self._dev.set_unsel_mode(UnselMode.OPEN)
+                self._log_write("Unselected-source mode restored to OPEN", FG_DIM)
+            except Exception:
+                pass
+        meta = {
+            "timestamp": timestamp, "vs_mv": vs, "vg_start_mv": vg_start,
+            "vg_end_mv": vg_end, "vg_step_mv": vg_step, "reps": reps,
+            "reverse": reverse,
+        }
+        self._rq.put(("meas_done", {
+            "type": "iv_random", "records": kept, "result": None, "meta": meta,
+            "n_sensors": len(sensors_list), "n_reps": reps,
+        }))
+    # -- IV - drain grounding test -------------------------------------------------------------
+    def _meas_IV_drain_grounding_worker(self, vs, vg_start, vg_end, vg_step, sensors_list,
+                               reverse, stab_s, settle_s, discard, reps) -> None:
+        """'IV - drain grounding test' state machine. Like I-V Randomised, but the random
+        order and the GND-unselected mode are ALWAYS active, and every
+        sensor is wrapped in a drain cycle:
+          unselected_sensors_mode: firmware UNSEL_MODE=GND (cmd 0x14, 'um 1')
+          new_chip:      stabilization wait → all connected → 0 V everywhere
+          vd_disc_apply: disconnect all → VD on the drain → sensor drain map
+                         → drain settle wait
+          iv:            single-sensor sweep
+          vd_con_apply:  drain back to 0 V → ALL drains connected (grounded)
+        so all drains are grounded before and after measuring each sensor."""
+        total_seq = discard + reps
+        self._log_write(
+            f"IV - drain grounding test: VS(Vd)={vs}mV  VG={vg_start}→{vg_end}mV  step={vg_step}mV  "
+            f"sensors={sensors_list}  discard={discard}  keep(reps)={reps}  "
+            f"→ {total_seq} sequences  (random + GND unselected forced)", CYAN)
+        self._log_vg_end_note(vg_start, vg_end, vg_step)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        def aborted() -> bool:
+            if self._abort_measurement:
+                self._rq.put(("log_warn", "IV - drain grounding test aborted by user"))
+                self._rq.put(("busy_off", None))
+                return True
+            return False
+        # Stage "unselected_sensors_mode": always GND ('um 1').
+        gnd_active = True
+        try:
+            self._dev.set_unsel_mode(UnselMode.GND)
+            self._log_write("Unselected-source mode: GND (always on in IV - drain grounding test)", CYAN)
+        except GratmaError as e:
+            gnd_active = False
+            self._log_write(
+                f"⚠ Firmware does not support SET_UNSEL_MODE (0x14): {e} — "
+                "continuing without grounding the unselected sources", ORANGE)
+        # Stage "new_chip": stabilization wait, then everything connected @ 0 V.
+        self._log_write(
+            f"Waiting {stab_s / 60.0:.2f} min for the system to stabilize ...", ORANGE)
+        if not self._sleep_abortable(stab_s):
+            self._rq.put(("log_warn", "IV - drain grounding test aborted during stabilization"))
+            self._rq.put(("busy_off", None))
+            return
+        self._dev.set_switch(sw=0, sw_map=0xFF)
+        self._dev.set_switch(sw=1, sw_map=0xFF)
+        self._log_write("All connected (SW0/SW1 = 0xFF)", FG_DIM)
+        for dac in (0, 1):
+            for out in (0, 1):
+                self._dev.set_voltage(dac=dac, out=out, mv=0)
+        self._log_write("0 volts applied (both DACs, both channels)", FG_DIM)
+        kept: list[dict] = []
+        for seq in range(1, total_seq + 1):
+            if aborted():
+                return
+            # Random order is ALWAYS used in this mode.
+            order = self._random_sequence_order(sensors_list)
+            is_discard = (seq <= discard)
+            kept_rep = seq - discard  # 1..reps for the sequences we keep
+            tag = "discarded" if is_discard else f"kept as rep {kept_rep}"
+            self._log_write(
+                f"── Sequence {seq}/{total_seq} ({tag}) — order {order} ──", MAGENTA)
+            for sensor in order:
+                if aborted():
+                    return
+                # Stage "vd_disc_apply": disconnect all pins, apply VD to the
+                # drain and pre-select this sensor's drain map while it settles.
+                self._dev.set_switch(sw=0, sw_map=0x00)
+                self._dev.set_switch(sw=1, sw_map=0x00)
+                self._dev.set_voltage(dac=1, out=0, mv=vs)
+                self._dev.set_voltage(dac=1, out=1, mv=vs)
+                map0, map1 = TESTIV_DRAIN_GND_DRAIN_SENSOR_MAPS[sensor]
+                self._dev.set_switch(sw=0, sw_map=map0)
+                self._dev.set_switch(sw=1, sw_map=map1)
+                self._log_write(
+                    f"  S{sensor}: all pins disconnected → {vs} mV on drain, "
+                    f"drain maps SW0=0x{map0:02X} SW1=0x{map1:02X}", FG_DIM)
+                self._log_write(f"  Waiting drain settle {settle_s:.0f} s ...", FG_DIM)
+                if not self._sleep_abortable(settle_s):
+                    self._rq.put(("log_warn", "IV - drain grounding test aborted during drain settle"))
+                    self._rq.put(("busy_off", None))
+                    return
+                if gnd_active:
+                    grounded = [s for s in range(1, 9) if s != sensor]
+                    self._log_write(
+                        f"  S{sensor} selected → sources to GND: "
+                        + ", ".join(f"S{g}" for g in grounded), CYAN)
+                    try:
+                        vbus = self._dev.get_vbus(0)
+                        self._log_write(
+                            f"  S{sensor} drain voltage (VS bus): {vbus:.4f} V", CYAN)
+                    except Exception as e:
+                        self._log_write(
+                            f"  Could not read the VS bus voltage: {e}", ORANGE)
+                # Stage "iv": single-sensor sweep.
+                if not self._wait_device_idle():
+                    self._rq.put(("log_warn", "IV - drain grounding test aborted by user"))
+                    self._rq.put(("busy_off", None))
+                    return
+                self._log_write(f"  Sweeping S{sensor} ...", FG_DIM)
+                self._dev.start_sweep_ex(
+                    vs_mv=vs, vg_start_mv=vg_start, vg_end_mv=vg_end,
+                    vg_step_mv=vg_step, sensors=self._sensor_mask([sensor]),
+                    reverse=reverse, repetitions=1, parallel=False)
+                self._wait_sweeping()
+                records = self._stream_records("iv", RecordType.SWEEP_POINT,
+                                               RecordType.SWEEP_END)
+                if records is None:
+                    self._rq.put(("log_warn", "IV - drain grounding test aborted by user"))
+                    self._rq.put(("busy_off", None))
+                    return
+                pts = [r for r in records if r["type"] == RecordType.SWEEP_POINT]
+                for r in pts:
+                    r["sensor"] = sensor
+                    r["rep"] = kept_rep
+                self._check_vg_end_reached(pts, vg_end, label=f"S{sensor}: ")
+                self._log_write(
+                    f"    S{sensor}: {len(pts)} points"
+                    + ("  (discarded)" if is_discard else ""),
+                    FG_DIM if is_discard else GREEN)
+                if not is_discard:
+                    kept.extend(pts)
+                # Stage "vd_con_apply": drain back to 0 V and ALL drains
+                # connected → every drain grounded until the next sensor.
+                self._dev.set_voltage(dac=1, out=0, mv=0)
+                self._dev.set_voltage(dac=1, out=1, mv=0)
+                self._dev.set_switch(sw=0, sw_map=0xFF)
+                self._dev.set_switch(sw=1, sw_map=0xFF)
+                self._log_write(
+                    "  All drains grounded again (0 V, SW0/SW1 = 0xFF)", FG_DIM)
+        # Stage "out": restore the classic unselected-source mode.
+        if gnd_active:
+            try:
+                self._dev.set_unsel_mode(UnselMode.OPEN)
+                self._log_write("Unselected-source mode restored to OPEN", FG_DIM)
+            except Exception:
+                pass
+        self._log_write("Finish", GREEN)
+        meta = {
+            "timestamp": timestamp, "vs_mv": vs, "vg_start_mv": vg_start,
+            "vg_end_mv": vg_end, "vg_step_mv": vg_step, "reps": reps,
+            "reverse": reverse,
+        }
+        self._rq.put(("meas_done", {
+            "type": "IV_drain_grounding", "records": kept, "result": None, "meta": meta,
+            "n_sensors": len(sensors_list), "n_reps": reps,
+        }))
     def _on_measurement_complete(self, data) -> None:
         """Callback when a measurement completes"""
         meas_type = data["type"]
@@ -1441,17 +2297,6 @@ class GratmaApp:
             self._log_write("No output folder: use 'Export CSV' to save", ORANGE)
     def _on_measurement_update(self, data) -> None:
         """Accumulates received points and refreshes the real-time graph"""
-        # Derive the live progress (sensor / repetition / direction) from the
-        # newest record, unless a worker already pushes explicit progress.
-        if not self._rt_progress_worker and data.get("records"):
-            r = data["records"][-1]
-            parts = [f"S{r['sensor']}", f"rep {r.get('rep') or 1}"]
-            phase = data.get("phase")
-            if phase:
-                parts.insert(0, f"phase {phase}")
-            if self._rt_kind != "idt":
-                parts.append("backward" if r.get("backward") else "forward")
-            self._rt_progress = " · ".join(parts)
         self._series_ingest(data["records"], phase=data.get("phase", 0))
         self._render_meas_plot(final=False)
     # -----------------------------------------------------------------------
@@ -1502,8 +2347,6 @@ class GratmaApp:
         title = self._RT_TITLES.get(self._rt_kind, "Measurement")
         if not final:
             title += " — Real-time"
-            if self._rt_progress:
-                title += f"  [{self._rt_progress}]"
         xlabel = "Time (s)" if self._rt_kind == "idt" else "$V_G$ (V)"
         # Pick the Y axis unit/scale from the current data so the plotted
         # numbers stay in a readable range (e.g. µA instead of 0.0000012 A).
@@ -1583,11 +2426,8 @@ class GratmaApp:
         self._export_measurement_files(self._last_meas_data, auto=False)
     @staticmethod
     def _sanitize_token(tok: str) -> str:
-        """Cleans a token for use in a file name. Spaces AND underscores are
-        converted to '-' (before, underscores were silently dropped and they
-        would break the <sample>_<sensor>_<type>_<rep> field separation that
-        the Data Analysis tab parses)."""
-        tok = (tok or "").strip().replace(" ", "-").replace("_", "-")
+        """Cleans a token for use in a file name."""
+        tok = (tok or "").strip().replace(" ", "-")
         return "".join(c for c in tok if c.isalnum() or c in "-+.")
     def _csv_path(self, sensor_tok: str, type_tok: str, rep: int) -> str:
         """Builds the path <sample>_<sensor>_<type>_<rep>_<extra>.csv in the output folder."""
@@ -1627,11 +2467,9 @@ class GratmaApp:
             for r in recs:
                 w.writerow([r["seq"], r["seq"] / 1000.0, r["v1"], r["v2"],
                             r.get("v3", 0.0), r.get("v4", 0.0)])
-
     def _export_iv_phase(self, records: list[dict], type_tok: str, meta: dict | None = None) -> list[str]:
         """Writes one CSV per (sensor, repetition) — or per repetition if parallel.
-        Returns the paths written. With dry_run=True it only returns the
-        target paths without writing anything (used by the overwrite guard)."""
+        Returns the paths written."""
         written: list[str] = []
         if self._cur_parallel:
             sensor_tok = "P" + "-".join(str(s) for s in self._cur_sensors)
@@ -1640,8 +2478,7 @@ class GratmaApp:
                 groups.setdefault(r.get("rep", 1) or 1, []).append(r)
             for rep, recs in sorted(groups.items()):
                 path = self._csv_path(sensor_tok, type_tok, rep)
-                if not dry_run:
-                    self._write_iv_csv(path, recs, meta)
+                self._write_iv_csv(path, recs, meta)
                 written.append(path)
         else:
             groups2: dict[tuple[int, int], list[dict]] = {}
@@ -1649,22 +2486,12 @@ class GratmaApp:
                 groups2.setdefault((r["sensor"], r.get("rep", 1) or 1), []).append(r)
             for (sensor, rep), recs in sorted(groups2.items()):
                 path = self._csv_path(f"{sensor}", type_tok, rep)
-                if not dry_run:
-                    self._write_iv_csv(path, recs, meta)
+                self._write_iv_csv(path, recs, meta)
                 written.append(path)
         return written
-
     def _export_measurement_files(self, data: dict, auto: bool) -> None:
         """Saves the measurement CSVs to the output folder with agreed naming."""
         try:
-            # Overwrite guard: warn and ask before replacing existing files;
-            # the user can change the sample name instead.
-            if not self._confirm_overwrite(data):
-                self._log_write("Export cancelled — no file was overwritten. "
-                                "Use 'Export CSV' to save with another name.", ORANGE)
-                if self._recorder:
-                    self._recorder.keep("export cancelled by the user")
-                return
             meas_type = data["type"]
             written: list[str] = []
             if meas_type == "iv":
