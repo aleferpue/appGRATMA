@@ -25,14 +25,21 @@ Cambios respecto a GRATMA_random_mejorado.py:
   4. Cada línea de la consola va etiquetada con el puerto, [COM8], [COM9], ...
      para poder seguir varias medidas simultáneas.
 
-  5. Los nombres de archivo no cambian:
+  5. Se crea automáticamente una subcarpeta por chip dentro de FOLDER_PATH:
+
+       FOLDER_PATH / Chip / Wafer_Chip_ArrayN_random_Secuencia_Electrolito.txt
+
+     El nombre de la subcarpeta coincide con el valor de la variable chip
+     introducido por terminal o mediante argumentos.
+
+  6. Los nombres de archivo no cambian:
 
        Wafer_Chip_ArrayN_random_Secuencia_Electrolito.txt
 
-     Como el nombre incluye wafer y chip, dos equipos distintos no colisionan.
-     El programa aborta si se repite el par wafer+chip o el mismo puerto.
+     El programa aborta si se repite el mismo puerto o el mismo nombre de chip,
+     ya que dos equipos no deben compartir una subcarpeta de salida.
 
-  6. La cabecera de cada TXT incluye además los puertos que estaban midiendo
+  7. La cabecera de cada TXT incluye además los puertos que estaban midiendo
      en paralelo, para poder rastrear las medidas simultáneas.
 """
 
@@ -48,7 +55,7 @@ import serial
 
 
 FOLDER_PATH = (
-    r"C:\GRATMA\medidas\APS5"   # Se cambia con respecto al PC que lo use.
+    r"C:\Users\Pilar\Nextcloud\ugr_PFM\GIV-GRATMA\Firmware\appGRATMA\log"   # Se cambia con respecto al PC que lo use.
 )
 
 # ==================== Información de sensores ====================
@@ -60,10 +67,10 @@ VGINIT = 0       # Vg inicial (mV)
 VGEND = 1200     # Vg final (mV)
 VGSWEEP = 15     # Paso de Vg (mV)
 FBWD = 1         # 0: solo forward | 1: forward + backward
-NUM_REP = 5      # Secuencias sobre todos los sensores
+NUM_REP = 1      # Secuencias sobre todos los sensores
 
 # ==================== Tiempos y modo ====================
-STABILIZE_S = 180
+STABILIZE_S = 1
 BETWEEN_SENSORS_S = 10
 GND_UNSELECTED = True
 
@@ -72,7 +79,7 @@ MEASUREMENT_MODE = "random"
 ELECTROLYTE = "PB-S0_01"
 BAUDRATE = 115200
 SERIAL_TIMEOUT_S = 1
-MEASUREMENT_TIMEOUT_S = 300
+MEASUREMENT_TIMEOUT_S = 100
 
 
 # -----------------------------------------------------------------
@@ -178,6 +185,7 @@ def build_device(port, wafer, chip_input):
         "wafer": wafer,
         "chip": normalize_chip_name(wafer, chip_input),
         "serial": None,
+        "output_folder": None,
         "saved_files": 0,
         "error": None,
     }
@@ -215,27 +223,27 @@ def prompt_devices():
 
 
 def validate_devices(devices):
-    """Comprueba que no se repiten puertos ni combinaciones wafer+chip."""
+    """Comprueba que no se repiten puertos ni carpetas de chip."""
     if not devices:
         raise RuntimeError("No se ha configurado ningún equipo.")
 
     seen_ports = set()
-    seen_chips = set()
+    seen_chip_folders = set()
 
     for device in devices:
         port = device["port"]
-        chip_key = (device["wafer"].upper(), device["chip"].upper())
+        chip_folder_key = device["chip"].upper()
 
         if port in seen_ports:
             raise RuntimeError(f"El puerto {port} está repetido.")
-        if chip_key in seen_chips:
+        if chip_folder_key in seen_chip_folders:
             raise RuntimeError(
-                f"El par wafer+chip {device['wafer']}_{device['chip']} está "
-                "repetido: los archivos de salida se sobrescribirían."
+                f"El chip {device['chip']} está repetido. Cada equipo debe "
+                "tener un nombre de chip distinto para usar una carpeta propia."
             )
 
         seen_ports.add(port)
-        seen_chips.add(chip_key)
+        seen_chip_folders.add(chip_folder_key)
 
 
 def get_runtime_configuration(args):
@@ -347,6 +355,12 @@ def build_temporary_txt_filename(final_filename):
     """Crea un TXT temporal para conservar la salida serie completa."""
     filename_without_extension = os.path.splitext(final_filename)[0]
     return f"All_info_{filename_without_extension}.txt"
+
+
+def build_chip_folder_path(base_folder_path, chip):
+    """Construye la carpeta de salida propia de un chip."""
+    chip_folder_name = sanitize_filename_component(chip)
+    return os.path.join(base_folder_path, chip_folder_name)
 
 
 # -----------------------------------------------------------------
@@ -512,10 +526,13 @@ def read_serial_to_file(
                     log(f"      · {line}", tag)
             elif time.time() - last_data_time > timeout:
                 if verbose:
-                    log("      [WARN] timeout esperando datos — corto la lectura", tag)
+                    log("[WARN] timeout esperando datos — corto la lectura", tag)
                 break
 
             if line == "(GRATMA) Measurement sweep completed":
+                break
+
+            if ("(MEAS_MGR) Measurement OK - result ready" in line):
                 break
 
     if verbose:
@@ -566,6 +583,12 @@ def split_txt_by_reps(
     number = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
     numeric_line_pattern = re.compile(
         rf"^{number};{number};{number};{number}$"
+    )
+
+    alt_line_pattern = re.compile(
+        rf"\(IV_SWEEP\) Sensor (\d+) Point \d+ \(rep (\d+)\): "
+        rf"Vfg = ({number})V, Is = ({number})A, Vs = ({number})V, "
+        rf"Ig = ({number})A"
     )
 
     def save_current_block(current_repetition, current_buffer):
@@ -624,18 +647,51 @@ def split_txt_by_reps(
     if collecting and data_buffer:
         save_current_block(repetition, data_buffer)
 
+    # Si no se ha encontrado el bloque "Vfg;Id;Ig;Is", se recurre al formato
+    # alternativo de líneas de progreso IV_SWEEP para reconstruir los datos.
+    if saved_filename is None:
+        alt_repetition = None
+        alt_buffer = []
+
+        for line in lines:
+            alt_match = alt_line_pattern.search(line)
+            if not alt_match:
+                continue
+
+            sensor_found = int(alt_match.group(1))
+            if sensor_found != sensor:
+                continue
+
+            rep_found = int(alt_match.group(2))
+            vfg_value, is_value, vs_value, ig_value = alt_match.group(3, 4, 5, 6)
+
+            if not alt_buffer:
+                alt_repetition = rep_found
+                alt_buffer = ["Vfg;Vs;Ig;Is"]
+
+            alt_buffer.append(f"{vfg_value};{vs_value};{ig_value};{is_value}")
+
+        if alt_buffer:
+            save_current_block(alt_repetition, alt_buffer)
+
     return saved_filename
 
 
 # -----------------------------------------------------------------
 # Hilo de medida de un equipo
 # -----------------------------------------------------------------
-def measure_device(device, folder_path, parallel_ports):
+def measure_device(device, parallel_ports):
     """Ejecuta todas las secuencias de un equipo. Se lanza en un hilo propio."""
     tag = device["port"]
     wafer = device["wafer"]
     chip = device["chip"]
     serial_connection = device["serial"]
+    chip_folder_path = device["output_folder"]
+
+    if not chip_folder_path:
+        raise RuntimeError(
+            f"No se ha configurado la carpeta de salida del chip {chip}."
+        )
 
     # Generador propio por hilo: cada equipo tiene su propio orden aleatorio.
     rng = random.Random()
@@ -701,7 +757,7 @@ def measure_device(device, folder_path, parallel_ports):
                     rep=1,
                     output_file=temporary_txt_filename,
                     timeout=MEASUREMENT_TIMEOUT_S,
-                    folder_path=folder_path,
+                    folder_path=chip_folder_path,
                     metadata=metadata,
                     tag=tag,
                 )
@@ -713,7 +769,7 @@ def measure_device(device, folder_path, parallel_ports):
                         sensor=sensor,
                         sequence=sequence,
                         input_filename=temporary_txt_filename,
-                        folder_path=folder_path,
+                        folder_path=chip_folder_path,
                         metadata=metadata,
                         tag=tag,
                     )
@@ -721,7 +777,7 @@ def measure_device(device, folder_path, parallel_ports):
                     if saved_filename is not None:
                         device["saved_files"] += 1
                         temporary_txt_path = os.path.join(
-                            folder_path,
+                            chip_folder_path,
                             temporary_txt_filename,
                         )
                         os.remove(temporary_txt_path)
@@ -800,6 +856,16 @@ def main(devices, folder_path):
         print("\n[ERROR] No hay ningún puerto disponible. Se aborta la medida.")
         return
 
+    print("\n[CARPETAS] Preparando una carpeta de salida para cada chip:")
+    for device in active_devices:
+        chip_folder_path = build_chip_folder_path(folder_path, device["chip"])
+        os.makedirs(chip_folder_path, exist_ok=True)
+        device["output_folder"] = chip_folder_path
+        print(
+            f"  {device['port']:>12}  |  chip {device['chip']}  |  "
+            f"{chip_folder_path}"
+        )
+
     parallel_ports = [device["port"] for device in active_devices]
     threads = []
 
@@ -829,7 +895,7 @@ def main(devices, folder_path):
         for device in active_devices:
             thread = threading.Thread(
                 target=measure_device,
-                args=(device, folder_path, parallel_ports),
+                args=(device, parallel_ports),
                 name=f"GRATMA-{device['port']}",
                 daemon=True,
             )
@@ -862,6 +928,8 @@ def main(devices, folder_path):
             f"  {device['port']:>12}  |  {device['wafer']}_{device['chip']}  |  "
             f"{device['saved_files']} archivos  |  {status}"
         )
+        if device["output_folder"]:
+            print(f"{'':>16}Carpeta: {device['output_folder']}")
 
     print("\n\033[1mFinish\033[0m")
 
