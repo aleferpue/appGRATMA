@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 r"""
-gratma_graph_para_todos.py
-==========================
+
 Versión portable del programa de gráficas GRATMA.
 
 No contiene rutas personales ni nombres de usuario. Al ejecutarlo:
