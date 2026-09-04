@@ -1,189 +1,128 @@
-# GRATMA Multipuerto
+# GRATMA Desktop App v2.0.1
 
-Script en Python utilizado para realizar **medidas I-V con varios dispositivos GRATMA al mismo tiempo** mediante distintos puertos serie.
 
-Cada GRATMA funciona de forma independiente en su propio hilo, permitiendo medir varios chips en paralelo. Las medidas se realizan sobre los 8 sensores siguiendo un orden aleatorio y los resultados se guardan automáticamente en una carpeta diferente para cada chip.
+Python desktop application (Tkinter + Matplotlib) for controlling and measuring the GRATMA device (I-V characterisation of GFET sensors) via the Vendor USB interface.
 
-## Requisitos
+## Table of Contents
+- [Installed Tools](#installed-tools)
+  - [Launch the app](#launch-the-app)
+- [How to Use](#how-to-use)
+  - [1. Connect device](#1-connect-device)
+  - [2. Configure the output (Measurements tab)](#2-configure-the-output-measurements-tab)
+  - [3. Select sensors and mode](#3-select-sensors-and-mode)
+  - [4. Choose measurement type and parameters](#4-choose-measurement-type-and-parameters)
+  - [5. Manual control of GRATMA (GRATMA tab)](#5-manual-control-of-gratma-gratma-tab)
+  - [6. Export](#6-export)
+- [CSV Format](#csv-format)
+- [Troubleshooting](#troubleshooting)
 
-Para ejecutar el programa es necesario tener Python instalado junto con la librería:
 
-```bash
-pip install pyserial
-```
+## Installed Tools
 
-Los principales módulos utilizados son:
 
-- Serial
+To run the software you need to install these libraries:
+
+- Matplotlib
+- Libusb
+- CSV
+- Os
+- Queue
 - Threading
-- Random
 - Time
 - Datetime
-- Argparse
-- Os
-- Re
+- Tkinter
+- Usb.core
 
-## Parámetros de medida
 
-Los principales parámetros de la medida se pueden modificar al principio del código:
 
-```python
-VD = 50
-VGINIT = 0
-VGEND = 1200
-VGSWEEP = 15
-FBWD = 1
-NUM_REP = 5
-```
+### Launch the app
 
-Donde:
-
-- **VD**: tensión de drain en mV.
-- **VGINIT**: tensión inicial de gate en mV.
-- **VGEND**: tensión final de gate en mV.
-- **VGSWEEP**: paso de tensión utilizado durante el barrido en mV.
-- **FBWD**: tipo de barrido.
-  - `0`: solamente barrido forward.
-  - `1`: barrido forward y backward.
-- **NUM_REP**: número de secuencias completas sobre los 8 sensores.
-
-También se pueden modificar los tiempos utilizados durante la medida:
-
-```python
-STABILIZE_S = 180
-BETWEEN_SENSORS_S = 10
-```
-
-En este caso se realiza una estabilización inicial de **180 segundos** y una espera de **10 segundos entre sensores**.
-
-## Carpeta de salida
-
-La carpeta principal donde se guardan las medidas se define al comienzo del código:
-
-```python
-FOLDER_PATH = r"C:\Users\labor\Desktop\chips_aging"
-```
-
-Esta ruta debe modificarse dependiendo del ordenador donde se ejecute el programa.
-
-Dentro de esta carpeta se crea automáticamente una carpeta diferente para cada chip:
-
-```text
-chips_aging/
-├── FxCy_aging/
-├── FwCz_aging/
-└── ...
-```
-
-## Ejecución del programa
-
-El programa puede ejecutarse directamente desde una terminal:
+Open a terminal in the same folder as your code is and run the following command:
 
 ```bash
-python GRATMA_multipuerto.py
+python app_v2.py
 ```
 
-Si no se introducen argumentos, el programa pregunta por terminal:
 
-1. Número de equipos que se van a medir.
-2. Puerto COM de cada equipo.
-3. Nombre del wafer.
-4. Nombre del chip.
+## How to use
 
-Por ejemplo:
+### 1. Connect device
 
-```text
-Número de equipos a medir en paralelo: 2
+1.  Click **⟳** (scan) → select GRATMA from the drop-down menu → **Connect**.
+2. Check: Green PCB LED means that it is connected;
 
---- Equipo 1/2 ---
-Puerto COM: COM8
-Nombre del wafer: USAGRAPH1
-Código del chip: F5C9
+### 2. Configure the output (Measurements tab)
 
---- Equipo 2/2 ---
-Puerto COM: COM9
-Nombre del wafer: USAGRAPH1
-Código del chip: F5C10
-```
+Under **Identification / Output**:
+- **Sample name**: file prefix (e.g. `BSN035_F4C7`).
+- **Extra**: optional free text added to the end of the name.
+- **Folder**: destination for the CSV files (button `…`). If defined, the files are saved automatically upon completion of each measurement.
 
-También es posible introducir directamente los dispositivos al ejecutar el programa:
+### 3. Select sensors and mode
 
-```bash
-python GRATMA_multipuerto.py --device COM8:USAGRAPH1:F5C9 --device COM9:USAGRAPH1:F5C10
-```
+In **Sensors**: select the sensors to be measured (1–8) and choose:
+- Sequential: one sensor after another.
+- Parallel: all at once, a combined curve.
 
-Si solamente se utiliza un GRATMA, también se puede ejecutar de la siguiente forma:
+### 4. Choose measurement type and parameters
 
-```bash
-python GRATMA_multipuerto.py --port COM8 --wafer USAGRAPH1 --chip F5C9
-```
+#### Parametric I-V
+- Parameters: 
+  - VD, drain voltage (mV)
+  - VG start, gate voltage init (mV)
+  - VG end, gate voltage end (mV)
+  - VG step, gate voltage sweep (mV), is the value that determines the sequential increment in the measurement
+  - Repetitions, number of repetitions
+  - Reverse sweep, only forward or forward and backward
 
-## Funcionamiento de la medida
+#### I vs Time (IDT)
+- Parameters: 
+  - VG,  gate voltage (mV)
+  - VD,  drain voltage (mV)
+  - Duration, total time in seconds
+  - Period (s), seconds between samples
 
-Una vez iniciado el programa:
+#### Two-Point Differential
+- Uses the same configured **I-V parameters**, in two phases:
+  1. **Phase 1** (baseline, without sample).
+  2. Physically add the sample and confirm in the dialogue box.
+  3. **Phase 2** (with sample).
+- Result: **ΔVG = VG_min2 − VG_min1**. CSV per phase (`diff-f1` / `diff-f2`).
 
-1. Se abren los puertos serie de los equipos.
-2. Se crea una carpeta de salida para cada chip.
-3. Se envía el comando `um 1` para poner a tierra los sensores que no se están midiendo.
-4. Se realiza el tiempo de estabilización inicial.
-5. Todos los GRATMA comienzan las medidas en paralelo.
-6. Cada equipo mide los 8 sensores siguiendo un orden aleatorio.
-7. El proceso se repite según el valor definido en `NUM_REP`.
-8. Los resultados se guardan automáticamente.
+Click **▶ Init** to start the process and click **⬛ STOP** to finalize it.
 
-El orden de los sensores cambia en cada secuencia. Además, el programa intenta alternar entre los sensores 1–4 y 5–8 para evitar medir siempre sensores de la misma zona de forma consecutiva.
+### 5. Manual control of GRATMA (GRATMA tab)
 
-## Archivos generados
+- **High-Level**: Set VD / Set VG in mV (the firmware calculates the DAC values).
+- **Raw DAC**: Set VD (1) / Set VG (0), channel, mV → Set Voltage.
+- **Switches**: (0/1) + hex map.
+- **INA228 readings**: manual (“↺ Read All”) or continuous with interval.
 
-Los archivos finales siguen el formato:
+### 6. Export
 
-```text
-Wafer_Chip_aging_ArrayN_random_Secuencia_Electrolito.txt
-```
+If a folder is configured, the CSV files are saved automatically upon completion. The **Export CSV** button saves them again (it asks for a folder if there isn’t one).
 
-Por ejemplo:
 
-```text
-USAGRAPH1_F5C9_aging_Array3_random_2_PB-S0_01.txt
-```
 
-Al comienzo de cada archivo se guarda información sobre la configuración utilizada durante la medida, como el chip, wafer, sensor, secuencia, tensiones utilizadas o puertos que estaban funcionando en paralelo.
+## CSV format
 
-Después se guardan los datos de la medida con las columnas:
+Name: `<sample>_<sensor>_<measure_type>_<rep>_<extra>.csv`
 
-```text
-Vfg;Vs;Ig;Is
-```
+Columns:
+- **I-V / Differential**: `Point, Direction, VG, ID, VD, IG`
+- **ID-T**: `Time_ms, Time_s, Vbus, ID, VG, IG`
 
-Los valores de **Vfg, Vs, Ig e Is se obtienen directamente de la información devuelta por el GRATMA**.
 
-Durante la medida también se genera un archivo temporal cuyo nombre comienza por:
 
-```text
-All_info_
-```
+## Troubleshooting
 
-Este archivo contiene toda la información recibida desde el GRATMA por el puerto serie y se mantiene para poder revisar los datos en caso de que haya algún problema.
+- **Device not detected**: check USB cable; install WinUSB on Interface 2 (Zadig); try `python -c ‘from gratma_usb import GratmaUSB; print(GratmaUSB.scan())’`.
+- **Ping-Pong inactive (orange LED)**: update firmware to v2.0.1.
+- **‘Pipe error (errno=32)’ error**: disconnect/reconnect USB and restart the app.
+- **Corrupt data / parsing error**: ensure you are using **the same version of firmware and app** (the record is 23 bytes in v2.0.1; mixing with older 14-byte firmware will fail).
 
-## Medidas en paralelo
 
-Cada GRATMA se ejecuta en un hilo diferente, por lo que varios dispositivos conectados a distintos puertos COM pueden realizar las medidas al mismo tiempo.
+---
 
-En la terminal, los mensajes de cada dispositivo aparecen identificados con su puerto:
-
-```text
-[COM8] ...
-[COM9] ...
-```
-
-De esta forma es más fácil seguir el estado de cada medida cuando se están utilizando varios dispositivos.
-
-El programa tampoco permite configurar dos veces el mismo puerto COM ni utilizar el mismo nombre de chip para dos equipos diferentes.
-
-## Notas
-
-- Comprobar los puertos COM antes de comenzar la medida.
-- Modificar `FOLDER_PATH` si el programa se utiliza en otro ordenador.
-- Comprobar que ningún otro programa esté utilizando los puertos serie.
-- Si no se puede generar correctamente el TXT final, se conserva el archivo `All_info_` para poder revisar los datos originales.
-- Al terminar todas las medidas, el programa muestra un resumen con los archivos guardados y el estado de cada dispositivo.
+**Versión**: 2.0.1  
+**Compatible con**: Firmware GRATMA v2.0.1
