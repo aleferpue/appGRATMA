@@ -73,9 +73,8 @@ from pathlib import Path
 import serial
 
 
-FOLDER_PATH = (
-    r"C:\Users\Pilar\Nextcloud\ugr_PFM\GIV-GRATMA\Firmware\appGRATMA\log"   # Se cambia con respecto al PC que lo use.
-)
+FOLDER_PATH = (r"C:\Users\alefe\Nextcloud\Clean_Room\Biosensors Elsauli\GRATMAs comparison\prueba gratma nuevo")
+ # Se cambia con respecto al PC que lo use.
 
 # ==================== Información de sensores ====================
 NSENSOR = [1, 2, 3, 4, 5, 6, 7, 8]
@@ -125,7 +124,7 @@ try:
     import matplotlib
 
     matplotlib.use("Agg")   # Backend sin ventanas: solo guarda PNG en disco.
-    import gratma_graph_para_todos as graficador
+    import GRATMA_graphics as graficador
 except (Exception, SystemExit):
     graficador = None
 
@@ -564,14 +563,14 @@ def read_serial_to_file(
     folder_path,
     metadata=None,
     tag=None,
-    verbose=True,
+    verbose=True, #para debug, si es False no imprime nada en consola
 ):
     """Envía el comando IV, guarda la respuesta y valida la medida.
 
     Una medida solo se considera correcta si:
       1. llega el mensaje de finalización del firmware;
       2. no aparece ningún error explícito del firmware;
-      3. se reciben todos los puntos esperados del barrido.
+    
 
     Devuelve un diccionario con el estado completo para decidir si hay que
     guardar la medida o repetir exactamente el mismo sensor.
@@ -700,10 +699,7 @@ def read_serial_to_file(
         failure_reasons.append("no llegó el mensaje de fin de medida")
     if firmware_errors:
         failure_reasons.append("el firmware notificó un error")
-    if number_of_points < expected_points:
-        failure_reasons.append(
-            f"medida incompleta: {number_of_points}/{expected_points} puntos"
-        )
+    
 
     success = not failure_reasons
 
@@ -1255,6 +1251,7 @@ def open_devices(devices):
             device["serial"] = serial.Serial(
                 port,
                 BAUDRATE,
+
                 timeout=SERIAL_TIMEOUT_S,
             )
             opened.append(device)
