@@ -100,6 +100,12 @@ BAUDRATE = 115200
 SERIAL_TIMEOUT_S = 1
 MEASUREMENT_TIMEOUT_S = 100
 
+# ==================== Reintentos ante fallos ====================
+# Número total de intentos permitidos para un mismo sensor. El programa solo
+# pasa al siguiente sensor cuando la medida actual ha terminado correctamente.
+MAX_SENSOR_ATTEMPTS = 5
+RETRY_DELAY_S = 5
+
 # ==================== Gráficas automáticas ====================
 GENERAR_GRAFICAS = True             # False para no generar gráficas al terminar.
 CARPETA_GRAFICAS = "graficas_GRATMA"  # Subcarpeta de salida dentro de cada chip.
@@ -532,6 +538,18 @@ def random_sequence_order(sensors, rng=random):
     return order
 
 
+def expected_measurement_points(vginit, vgend, vgsweep, fbwd, rep):
+    """Calcula el número de puntos esperado para validar una medida IV."""
+    if vgsweep == 0:
+        raise ValueError("VGSWEEP no puede ser 0.")
+
+    points_per_direction = int(
+        round(abs(vgend - vginit) / abs(vgsweep))
+    ) + 1
+    directions = 2 if fbwd else 1
+    return points_per_direction * directions * max(1, int(rep))
+
+
 def read_serial_to_file(
     ser,
     vd,
@@ -548,7 +566,16 @@ def read_serial_to_file(
     tag=None,
     verbose=True,
 ):
-    """Envía el comando IV y guarda la respuesta completa en un TXT."""
+    """Envía el comando IV, guarda la respuesta y valida la medida.
+
+    Una medida solo se considera correcta si:
+      1. llega el mensaje de finalización del firmware;
+      2. no aparece ningún error explícito del firmware;
+      3. se reciben todos los puntos esperados del barrido.
+
+    Devuelve un diccionario con el estado completo para decidir si hay que
+    guardar la medida o repetir exactamente el mismo sensor.
+    """
     value = sensor_bitmask(sensor)
     iv_command = (
         f"iv {vd} {vginit} {vgend} {vgsweep} "
@@ -575,10 +602,22 @@ def read_serial_to_file(
         except ValueError:
             return None
 
-    number_of_points = 0
+    progress_point_pattern = re.compile(
+        r"^\((?:GRATMA|IV_SWEEP)\) Sensor \d+ Point \d+"
+    )
+    explicit_error_pattern = re.compile(
+        r"(?:^|\))\s*ERROR\s*:",
+        flags=re.IGNORECASE,
+    )
+
+    numeric_points = 0
+    progress_points = 0
     max_vg = None
     dirac_vg = None
     min_abs_id = None
+    firmware_errors = []
+    completion_received = False
+    timed_out = False
 
     with open(current_file, "w", encoding="utf-8") as file_object:
         # La cabecera se añade también al All_info para que todos los TXT
@@ -592,10 +631,28 @@ def read_serial_to_file(
             if line:
                 file_object.write(line + "\n")
                 last_data_time = time.time()
-                point = parse_point(line)
 
+                line_lower = line.lower()
+                is_firmware_error = (
+                    explicit_error_pattern.search(line) is not None
+                    or "calibration failed" in line_lower
+                    or "measurement failed" in line_lower
+                    or "measurement aborted" in line_lower
+                    or "sweep aborted" in line_lower
+                )
+                if is_firmware_error and line not in firmware_errors:
+                    firmware_errors.append(line)
+
+                progress_match = progress_point_pattern.match(line)
+                new_point_received = False
+                if progress_match:
+                    progress_points += 1
+                    new_point_received = True
+
+                point = parse_point(line)
                 if point is not None:
-                    number_of_points += 1
+                    numeric_points += 1
+                    new_point_received = True
                     vg, drain_current = point
 
                     if max_vg is None or vg > max_vg:
@@ -604,24 +661,51 @@ def read_serial_to_file(
                         min_abs_id = abs(drain_current)
                         dirac_vg = vg
 
-                    if verbose and number_of_points % 25 == 0:
-                        log(
-                            f"      ... {number_of_points} puntos "
-                            f"(Vfg≈{vg:.4g})",
-                            tag,
-                        )
-                elif verbose:
+                number_of_points = max(numeric_points, progress_points)
+                if (
+                    verbose
+                    and new_point_received
+                    and number_of_points % 25 == 0
+                ):
+                    log(f"      ... {number_of_points} puntos recibidos", tag)
+                elif verbose and not new_point_received:
                     log(f"      · {line}", tag)
             elif time.time() - last_data_time > timeout:
+                timed_out = True
                 if verbose:
                     log("[WARN] timeout esperando datos — corto la lectura", tag)
                 break
 
             if line == "(GRATMA) Measurement sweep completed":
+                completion_received = True
                 break
 
-            if ("(MEAS_MGR) Measurement OK - result ready" in line):
+            if "(MEAS_MGR) Measurement OK - result ready" in line:
+                completion_received = True
                 break
+
+    number_of_points = max(numeric_points, progress_points)
+    expected_points = expected_measurement_points(
+        vginit=vginit,
+        vgend=vgend,
+        vgsweep=vgsweep,
+        fbwd=fbwd,
+        rep=rep,
+    )
+
+    failure_reasons = []
+    if timed_out:
+        failure_reasons.append("timeout de comunicación")
+    if not completion_received:
+        failure_reasons.append("no llegó el mensaje de fin de medida")
+    if firmware_errors:
+        failure_reasons.append("el firmware notificó un error")
+    if number_of_points < expected_points:
+        failure_reasons.append(
+            f"medida incompleta: {number_of_points}/{expected_points} puntos"
+        )
+
+    success = not failure_reasons
 
     if verbose:
         extra = ""
@@ -629,14 +713,56 @@ def read_serial_to_file(
             extra = f" | Vfg_max={max_vg:.4g}"
             if dirac_vg is not None:
                 extra += f" | min|Id| en Vfg={dirac_vg:.4g}"
+
+        status = "OK" if success else "FALLIDA"
         log(
-            f"    -> {number_of_points} puntos guardados "
-            f"en {output_file}{extra}",
+            f"    -> Medida {status}: {number_of_points}/{expected_points} "
+            f"puntos en {output_file}{extra}",
             tag,
         )
+        for error_line in firmware_errors:
+            log(f"    [ERROR FIRMWARE] {error_line}", tag)
+        if failure_reasons:
+            log(f"    Motivo: {'; '.join(failure_reasons)}", tag)
 
-    return number_of_points
+    return {
+        "success": success,
+        "number_of_points": number_of_points,
+        "expected_points": expected_points,
+        "completion_received": completion_received,
+        "timed_out": timed_out,
+        "firmware_errors": firmware_errors,
+        "failure_reasons": failure_reasons,
+        "temporary_path": current_file,
+    }
 
+
+def archive_failed_temporary_file(
+    folder_path,
+    temporary_filename,
+    attempt,
+    reason="FAILED",
+):
+    """Renombra el All_info fallido para conservarlo antes del reintento."""
+    source_path = os.path.join(folder_path, temporary_filename)
+    if not os.path.exists(source_path):
+        return None
+
+    safe_reason = sanitize_filename_component(reason).upper()
+    stem, extension = os.path.splitext(temporary_filename)
+    candidate_name = f"{safe_reason}_attempt{attempt}_{stem}{extension}"
+    candidate_path = os.path.join(folder_path, candidate_name)
+
+    counter = 2
+    while os.path.exists(candidate_path):
+        candidate_name = (
+            f"{safe_reason}_attempt{attempt}_{stem}_{counter}{extension}"
+        )
+        candidate_path = os.path.join(folder_path, candidate_name)
+        counter += 1
+
+    os.replace(source_path, candidate_path)
+    return candidate_name
 
 def save_clean_measurement(output_path, metadata, data_buffer):
     """Guarda un TXT limpio con parámetros, columnas y datos numéricos.
@@ -787,7 +913,12 @@ def split_txt_by_reps(
 # Hilo de medida de un equipo
 # -----------------------------------------------------------------
 def measure_device(device, parallel_ports):
-    """Ejecuta todas las secuencias de un equipo. Se lanza en un hilo propio."""
+    """Ejecuta todas las secuencias de un equipo. Se lanza en un hilo propio.
+
+    Cada sensor se repite hasta obtener una medida completa y sin errores. Si
+    se agotan MAX_SENSOR_ATTEMPTS, el equipo se detiene en ese sensor y no pasa
+    al siguiente; los demás puertos continúan de forma independiente.
+    """
     tag = device["port"]
     wafer = device["wafer"]
     chip = device["chip"]
@@ -832,16 +963,6 @@ def measure_device(device, parallel_ports):
                     tag,
                 )
 
-                metadata = build_measurement_metadata(
-                    port=device["port"],
-                    wafer=wafer,
-                    chip=chip,
-                    sensor=sensor,
-                    sequence=sequence,
-                    random_order=order,
-                    parallel_ports=parallel_ports,
-                )
-
                 final_filename = build_measurement_filename(
                     wafer=wafer,
                     chip=chip,
@@ -852,47 +973,144 @@ def measure_device(device, parallel_ports):
                     final_filename
                 )
 
-                read_serial_to_file(
-                    ser=serial_connection,
-                    vd=VD,
-                    vginit=VGINIT,
-                    vgend=VGEND,
-                    vgsweep=VGSWEEP,
-                    sensor=sensor,
-                    fbwd=FBWD,
-                    rep=1,
-                    output_file=temporary_txt_filename,
-                    timeout=MEASUREMENT_TIMEOUT_S,
-                    folder_path=chip_folder_path,
-                    metadata=metadata,
-                    tag=tag,
-                )
+                sensor_completed = False
+                last_failure = "motivo desconocido"
 
-                try:
-                    saved_filename = split_txt_by_reps(
+                for attempt in range(1, MAX_SENSOR_ATTEMPTS + 1):
+                    log(
+                        f"    [INTENTO {attempt}/{MAX_SENSOR_ATTEMPTS}] "
+                        f"S{sensor}, secuencia {sequence}",
+                        tag,
+                    )
+
+                    metadata = build_measurement_metadata(
+                        port=device["port"],
                         wafer=wafer,
                         chip=chip,
                         sensor=sensor,
                         sequence=sequence,
-                        input_filename=temporary_txt_filename,
+                        random_order=order,
+                        parallel_ports=parallel_ports,
+                    )
+                    metadata["intento_sensor"] = attempt
+                    metadata["max_intentos_sensor"] = MAX_SENSOR_ATTEMPTS
+
+                    measurement_result = read_serial_to_file(
+                        ser=serial_connection,
+                        vd=VD,
+                        vginit=VGINIT,
+                        vgend=VGEND,
+                        vgsweep=VGSWEEP,
+                        sensor=sensor,
+                        fbwd=FBWD,
+                        rep=1,
+                        output_file=temporary_txt_filename,
+                        timeout=MEASUREMENT_TIMEOUT_S,
                         folder_path=chip_folder_path,
                         metadata=metadata,
                         tag=tag,
                     )
 
-                    if saved_filename is not None:
-                        device["saved_files"] += 1
-                        temporary_txt_path = os.path.join(
-                            chip_folder_path,
-                            temporary_txt_filename,
+                    if not measurement_result["success"]:
+                        last_failure = "; ".join(
+                            measurement_result["failure_reasons"]
                         )
-                        os.remove(temporary_txt_path)
-                except Exception as error:
-                    log(f"    [WARN] split_txt_by_reps falló: {error}", tag)
-                    log(
-                        "    El TXT temporal se conserva para poder "
-                        f"recuperar los datos: {temporary_txt_filename}",
-                        tag,
+                        archived_name = archive_failed_temporary_file(
+                            folder_path=chip_folder_path,
+                            temporary_filename=temporary_txt_filename,
+                            attempt=attempt,
+                            reason="FAILED_MEASUREMENT",
+                        )
+                        if archived_name:
+                            log(
+                                f"    [DIAGNÓSTICO] Intento fallido guardado "
+                                f"como: {archived_name}",
+                                tag,
+                            )
+                    else:
+                        try:
+                            saved_filename = split_txt_by_reps(
+                                wafer=wafer,
+                                chip=chip,
+                                sensor=sensor,
+                                sequence=sequence,
+                                input_filename=temporary_txt_filename,
+                                folder_path=chip_folder_path,
+                                metadata=metadata,
+                                tag=tag,
+                            )
+                        except Exception as error:
+                            saved_filename = None
+                            last_failure = f"error procesando el TXT: {error}"
+                            log(
+                                f"    [WARN] split_txt_by_reps falló: {error}",
+                                tag,
+                            )
+
+                        if saved_filename is not None:
+                            device["saved_files"] += 1
+                            temporary_txt_path = os.path.join(
+                                chip_folder_path,
+                                temporary_txt_filename,
+                            )
+                            try:
+                                os.remove(temporary_txt_path)
+                            except FileNotFoundError:
+                                pass
+
+                            sensor_completed = True
+                            log(
+                                f"    [OK] S{sensor}, secuencia {sequence} "
+                                f"completado en el intento {attempt}.",
+                                tag,
+                            )
+                            break
+
+                        if last_failure == "motivo desconocido":
+                            last_failure = (
+                                "la medida terminó, pero no se pudo crear "
+                                "el TXT definitivo"
+                            )
+                        archived_name = archive_failed_temporary_file(
+                            folder_path=chip_folder_path,
+                            temporary_filename=temporary_txt_filename,
+                            attempt=attempt,
+                            reason="FAILED_PROCESSING",
+                        )
+                        if archived_name:
+                            log(
+                                f"    [DIAGNÓSTICO] TXT conservado como: "
+                                f"{archived_name}",
+                                tag,
+                            )
+
+                    if attempt < MAX_SENSOR_ATTEMPTS:
+                        log(
+                            f"    [REINTENTO] Se repetirá S{sensor} en "
+                            f"{RETRY_DELAY_S}s. No se pasa al siguiente sensor.",
+                            tag,
+                        )
+                        countdown_sleep(
+                            RETRY_DELAY_S,
+                            label="reintento: ",
+                            tag=tag,
+                        )
+
+                        # Se vuelve a establecer el modo de sensores no medidos
+                        # a tierra antes de iniciar el nuevo intento.
+                        if GND_UNSELECTED:
+                            send_cmd(
+                                serial_connection,
+                                "um 1",
+                                tag=tag,
+                                verbose=False,
+                            )
+
+                if not sensor_completed:
+                    raise RuntimeError(
+                        f"S{sensor}, secuencia {sequence}, falló tras "
+                        f"{MAX_SENSOR_ATTEMPTS} intentos: {last_failure}. "
+                        "El equipo se detiene sin pasar al siguiente sensor."
                     )
 
     except Exception as error:
